@@ -82,69 +82,6 @@ static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
                                    /*addrspace=*/3u);
 }
 
-// Compute the (row, col) coordinates for each element owned by a thread,
-// given a blocked encoding and tensor shape.
-//
-// For blocked encoding with sizePerThread=[sM,sN], threadsPerWarp=[tM,tN],
-// warpsPerCTA=[wM,wN], the tile covered by all threads is:
-//   tileM = wM * tM * sM,  tileN = wN * tN * sN
-//
-// Thread (warp w, lane l) owns elements at:
-//   For each (sm, sn) in [0,sM) × [0,sN):
-//     row = (w / wN) * tM * sM + (l / tN) * sM + sm
-//     col = (w % wN) * tN * sN + (l % tN) * sN + sn
-//
-// If tensor shape exceeds the tile, the pattern repeats (wraps).
-// Element index in the struct = linearized over the full shape repetitions.
-struct ElemCoord { int64_t row, col, elemIdx; };
-
-static SmallVector<ElemCoord> getBlockedElemCoords(
-    ttg::BlockedEncodingAttr enc, ArrayRef<int64_t> shape) {
-
-    auto spt = enc.getSizePerThread();    // [sM, sN]
-    auto tpw = enc.getThreadsPerWarp();   // [tM, tN]
-    auto wpc = enc.getWarpsPerCTA();      // [wM, wN]
-
-    int64_t sM = spt[0], sN = spt[1];
-    int64_t tM = tpw[0], tN = tpw[1];
-    int64_t wM = wpc[0], wN = wpc[1];
-
-    int64_t tileM = wM * tM * sM;
-    int64_t tileN = wN * tN * sN;
-
-    int64_t M = shape[0], N = shape[1];
-    int64_t repsM = (M + tileM - 1) / tileM;
-    int64_t repsN = (N + tileN - 1) / tileN;
-
-    int64_t numWarps = wM * wN;
-    int64_t numLanes = tM * tN;  // threads per warp
-    (void)numWarps;
-    (void)numLanes;
-
-    // Total elements per thread
-    int64_t elemsPerThread = repsM * repsN * sM * sN;
-    SmallVector<ElemCoord> coords(elemsPerThread);
-
-    int64_t idx = 0;
-    for (int64_t rm = 0; rm < repsM; ++rm) {
-        for (int64_t rn = 0; rn < repsN; ++rn) {
-            for (int64_t sm = 0; sm < sM; ++sm) {
-                for (int64_t sn = 0; sn < sN; ++sn) {
-                    // These are parametric in (w, l) — we store the
-                    // offsets that need to be added to the thread's base position.
-                    // base_row(w,l) = (w/wN)*tM*sM + (l/tN)*sM
-                    // base_col(w,l) = (w%wN)*tN*sN + (l%tN)*sN
-                    // full_row = rm*tileM + base_row + sm
-                    // full_col = rn*tileN + base_col + sn
-                    coords[idx] = {rm * tileM + sm, rn * tileN + sn, idx};
-                    idx++;
-                }
-            }
-        }
-    }
-    return coords;
-}
-
 struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -283,37 +220,43 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return failure();
 
         // ── Compute per-thread element coordinates ────────────────────────
-        // These give the static offsets; runtime base comes from (warpId, laneId).
+        // Use emitOffsetForLayout (LinearLayout-based) to match the canonical
+        // element ordering used by ConvertLayoutOp.  getBlockedElemCoords
+        // ignored the encoding's order field, causing mismatches when a
+        // convert_layout followed the dot (e.g. trans epilogue).
 
-        auto aCoordsStatic = getBlockedElemCoords(aSrcEnc, aType.getShape());
-        auto bCoordsStatic = getBlockedElemCoords(bSrcEnc, bType.getShape());
-        auto cCoordsStatic = getBlockedElemCoords(cEnc, cType.getShape());
+        // emitOffsetForLayout needs a RankedTensorType with the blocked encoding.
+        // aType/bType have DotOperandEncoding, so construct types with the source encoding.
+        auto aBlockedTy = RankedTensorType::get(aType.getShape(), aType.getElementType(), aSrcEnc);
+        auto bBlockedTy = RankedTensorType::get(bType.getShape(), bType.getElementType(), bSrcEnc);
+        auto aOffsets = emitOffsetForLayout(aSrcEnc, aBlockedTy);
+        auto bOffsets = emitOffsetForLayout(bSrcEnc, bBlockedTy);
+        auto cOffsets = emitOffsetForLayout(cEnc, cType);
 
         // Verify element counts match
-        if ((int64_t)elemsA.size() != (int64_t)aCoordsStatic.size() ||
-            (int64_t)elemsB.size() != (int64_t)bCoordsStatic.size() ||
-            (int64_t)elemsC.size() != (int64_t)cCoordsStatic.size())
+        if ((int64_t)elemsA.size() != (int64_t)aOffsets.size() ||
+            (int64_t)elemsB.size() != (int64_t)bOffsets.size() ||
+            (int64_t)elemsC.size() != (int64_t)cOffsets.size())
             return failure();
 
         // ── Compute runtime thread base position ──────────────────────────
-        // For encoding with sizePerThread=[sM,sN], threadsPerWarp=[tM,tN],
-        // warpsPerCTA=[wM,wN]:
-        //   base_row = (warpId / wN) * tM * sM + (laneId / tN) * sM
-        //   base_col = (warpId % wN) * tN * sN + (laneId % tN) * sN
-
         // Compute base (row, col) for this thread within a tensor of shape [rows, cols].
+        // Respects the encoding's order field for warp/lane decomposition.
         // Wraps by tileM/tileN to handle redundant threads.
         auto makeBase = [&](ttg::BlockedEncodingAttr enc, int64_t rows, int64_t cols)
             -> std::pair<Value, Value> {
             auto spt = enc.getSizePerThread();
             auto tpw = enc.getThreadsPerWarp();
             auto wpc = enc.getWarpsPerCTA();
+            auto order = enc.getOrder();
 
             int64_t sM = spt[0], sN = spt[1];
             int64_t tM = tpw[0], tN = tpw[1];
             int64_t wM = wpc[0], wN = wpc[1];
             int64_t tileM = wM * tM * sM;
             int64_t tileN = wN * tN * sN;
+
+            bool colFastest = (order[0] == 1);
 
             Value wN_val  = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
             Value tN_val  = arith::ConstantIntOp::create(rewriter, loc, tN, 32);
@@ -322,23 +265,33 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value tNsN    = arith::ConstantIntOp::create(rewriter, loc, tN * sN, 32);
             Value sN_val  = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
 
-            // warpRow = warpId / wN, warpCol = warpId % wN
-            Value warpRow = arith::DivUIOp::create(rewriter, loc, warpId, wN_val);
-            Value warpCol = arith::RemUIOp::create(rewriter, loc, warpId, wN_val);
+            // Warp decomposition: faster dim uses mod, slower uses div
+            Value wR, wC;
+            if (colFastest) {
+                wR = arith::DivUIOp::create(rewriter, loc, warpId, wN_val);
+                wC = arith::RemUIOp::create(rewriter, loc, warpId, wN_val);
+            } else {
+                Value wM_val = arith::ConstantIntOp::create(rewriter, loc, wM, 32);
+                wR = arith::RemUIOp::create(rewriter, loc, warpId, wM_val);
+                wC = arith::DivUIOp::create(rewriter, loc, warpId, wM_val);
+            }
+            // Lane decomposition: faster dim uses mod, slower uses div
+            Value lR, lC;
+            if (colFastest) {
+                lR = arith::DivUIOp::create(rewriter, loc, laneId, tN_val);
+                lC = arith::RemUIOp::create(rewriter, loc, laneId, tN_val);
+            } else {
+                Value tM_val = arith::ConstantIntOp::create(rewriter, loc, tM, 32);
+                lR = arith::RemUIOp::create(rewriter, loc, laneId, tM_val);
+                lC = arith::DivUIOp::create(rewriter, loc, laneId, tM_val);
+            }
 
-            // laneRow = laneId / tN, laneCol = laneId % tN
-            Value laneRow = arith::DivUIOp::create(rewriter, loc, laneId, tN_val);
-            Value laneCol = arith::RemUIOp::create(rewriter, loc, laneId, tN_val);
-
-            // base_row = warpRow * tM * sM + laneRow * sM
             Value baseRow = arith::AddIOp::create(rewriter, loc,
-                arith::MulIOp::create(rewriter, loc, warpRow, tMsM),
-                arith::MulIOp::create(rewriter, loc, laneRow, sM_val));
-
-            // base_col = warpCol * tN * sN + laneCol * sN
+                arith::MulIOp::create(rewriter, loc, wR, tMsM),
+                arith::MulIOp::create(rewriter, loc, lR, sM_val));
             Value baseCol = arith::AddIOp::create(rewriter, loc,
-                arith::MulIOp::create(rewriter, loc, warpCol, tNsN),
-                arith::MulIOp::create(rewriter, loc, laneCol, sN_val));
+                arith::MulIOp::create(rewriter, loc, wC, tNsN),
+                arith::MulIOp::create(rewriter, loc, lC, sN_val));
 
             // Wrap to handle redundant threads (tileM > rows)
             if (tileM > rows) {
@@ -401,8 +354,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         // ── Phase 1: Scatter A into TG_AB, barrier, pre-load A tiles ─────
         for (size_t i = 0; i < elemsA.size(); ++i) {
-            auto &c = aCoordsStatic[i];
-            scatter1(ptrTG, elemsA[i], flatIdx(aBaseRow, aBaseCol, c.row, c.col, K));
+            scatter1(ptrTG, elemsA[i], flatIdx(aBaseRow, aBaseCol, aOffsets[i][0], aOffsets[i][1], K));
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
@@ -431,8 +383,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // Barrier ensures all warps finished loading A before any warp writes C.
         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
         for (size_t i = 0; i < elemsC.size(); ++i) {
-            auto &c = cCoordsStatic[i];
-            scatter1(ptrTG, elemsC[i], flatIdx(cBaseRow, cBaseCol, c.row, c.col, N));
+            scatter1(ptrTG, elemsC[i], flatIdx(cBaseRow, cBaseCol, cOffsets[i][0], cOffsets[i][1], N));
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
@@ -454,8 +405,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // Need TG barrier first so all warps finish loading C before any writes B.
         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
         for (size_t i = 0; i < elemsB.size(); ++i) {
-            auto &c = bCoordsStatic[i];
-            scatter1(ptrTG, elemsB[i], flatIdx(bBaseRow, bBaseCol, c.row, c.col, N));
+            scatter1(ptrTG, elemsB[i], flatIdx(bBaseRow, bBaseCol, bOffsets[i][0], bOffsets[i][1], N));
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
@@ -498,8 +448,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto outElemTy = cType.getElementType();
         SmallVector<Value> resultElems(elemsC.size());
         for (size_t i = 0; i < elemsC.size(); ++i) {
-            auto &c = cCoordsStatic[i];
-            Value val = gather1(ptrTG, flatIdx(cBaseRow, cBaseCol, c.row, c.col, N));
+            Value val = gather1(ptrTG, flatIdx(cBaseRow, cBaseCol, cOffsets[i][0], cOffsets[i][1], N));
             // MMA operates in f32 — truncate back if output type is narrower
             if (val.getType() != outElemTy)
                 val = arith::TruncFOp::create(rewriter, loc, outElemTy, val);
