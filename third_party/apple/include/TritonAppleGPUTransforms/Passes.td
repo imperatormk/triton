@@ -25,4 +25,22 @@ def AccelerateAppleMatmul : Pass<"triton-apple-accelerate-matmul", "mlir::Module
   ];
 }
 
+def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"> {
+  let summary = "Strip efficient_layout from large gather ops to avoid IR explosion";
+
+  let description = [{
+    The upstream OptimizeThreadLocality pass marks gather ops with
+    efficient_layout, forcing warp-local shuffle lowering. For large tensors
+    this generates thousands of unrolled shuffle+select instructions that
+    exceed the Metal GPU JIT compiler's instruction limit. This pass clears
+    the flag so the gather falls back to shared memory, and the subsequent
+    RemoveLayoutConversions pass eliminates the now-unnecessary convert_layouts.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 #endif // TRITON_APPLE_GPU_TRANSFORMS_PASSES

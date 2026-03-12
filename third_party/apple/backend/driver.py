@@ -18,7 +18,7 @@ def ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
     return {
-        "i1": "int32_t", "i8": "int8_t", "i16": "int16_t",
+        "i1": "int32_t", "u1": "int32_t", "i8": "int8_t", "i16": "int16_t",
         "i32": "int32_t", "i64": "int64_t",
         "u32": "uint32_t", "u64": "uint64_t",
         "fp16": "float", "bf16": "float", "fp32": "float", "fp64": "double",
@@ -28,6 +28,7 @@ def ty_to_cpp(ty):
 # Scalar type → (struct.pack format char, byte size, alignment)
 _SCALAR_PACK_INFO = {
     "i1":  ("b", 1, 1),   # i1 stored as 1 byte
+    "u1":  ("b", 1, 1),   # u1 (unsigned boolean)
     "i8":  ("b", 1, 1),
     "i16": ("h", 2, 2),
     "i32": ("i", 4, 4),
@@ -71,7 +72,7 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
     buf = bytearray(total_size)
     for ty, val, offset in zip(scalar_types, scalar_values, offsets):
         fmt, size, _ = _SCALAR_PACK_INFO[ty]
-        if ty == "i1":
+        if ty in ("i1", "u1"):
             val = 1 if val else 0
         elif ty == "bf16":
             # bf16: convert float → bf16 bits, pack as uint16

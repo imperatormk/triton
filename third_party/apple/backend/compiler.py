@@ -199,6 +199,9 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+        # Undo warp-local gather optimization for large tensors — the fully
+        # unrolled shuffle code exceeds the Metal GPU JIT instruction limit.
+        self._apple.passes.ttgpuir.add_simplify_gather(pm)
 
         # THE Apple-specific pass: BlockedEncoding → AppleMmaEncoding
         self._apple.passes.ttgpuir.add_accelerate_matmul(pm)

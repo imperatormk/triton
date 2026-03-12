@@ -21,6 +21,12 @@ void init_triton_apple_passes_ttgpuir(py::module &&m) {
         },
         "Rewrite tt.dot ops to use AppleMmaEncoding (simdgroup_multiply_accumulate)");
 
+    m.def("add_simplify_gather",
+        [](mlir::PassManager &pm) {
+            pm.addPass(applegpu::createSimplifyGatherLayoutPass());
+        },
+        "Strip efficient_layout from large gather ops to avoid Metal JIT crash");
+
     m.def("add_to_llvmir",
         [](mlir::PassManager &pm) {
             pm.addPass(applegpu::createConvertTritonAppleGPUToLLVMPass());

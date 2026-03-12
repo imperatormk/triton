@@ -1,6 +1,7 @@
 add_triton_library(TritonAppleGPUTransforms
   AppleMmaGroup.cpp
-  AccelerateAppleMatmul.cpp  # TODO
+  AccelerateAppleMatmul.cpp
+  SimplifyGatherLayout.cpp
 
   DEPENDS
   TritonAppleGPUDialectIncGen
