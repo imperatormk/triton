@@ -15,7 +15,15 @@ using namespace mlir;
 using namespace mlir::LLVM;
 using namespace mlir::triton;
 
+namespace ttg = mlir::triton::gpu;
+
 namespace mlir::triton::applegpu {
+
+int TargetInfo::getAddressSpace(Attribute addressSpace) const {
+    if (mlir::isa<ttg::SharedMemorySpaceAttr>(addressSpace))
+        return 3;  // threadgroup
+    return 0;
+}
 
 static LLVMFuncOp getOrInsertAirIntrinsic3xi32(RewriterBase &rewriter,
                                                 ModuleOp mod, StringRef name) {

@@ -64,6 +64,19 @@ def dot_multi_cta_kernel(
 
 
 @triton.jit
+def kkt_kernel(K_ptr, OUT_ptr, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr):
+    """K @ K^T pattern from fla chunk_scaled_dot_kkt_fwd_kernel."""
+    i_t = tl.program_id(0)
+    offs_t = i_t * BT + tl.arange(0, BT)
+    offs_d = tl.arange(0, D)
+    k_ptrs = K_ptr + offs_t[:, None] * D + offs_d[None, :]
+    b_k = tl.load(k_ptrs).to(tl.float32)
+    b_A = tl.dot(b_k, tl.trans(b_k))
+    out_ptrs = OUT_ptr + i_t * BT * BT + tl.arange(0, BT)[:, None] * BT + tl.arange(0, BT)[None, :]
+    tl.store(out_ptrs, b_A)
+
+
+@triton.jit
 def matmul_kernel(
     A, B, C,
     M, N, K,
@@ -695,6 +708,32 @@ class TestDot:
                 pytest.xfail('TG memory exceeds 32 KB limit (~72 KB needed)')
             else:
                 pytest.xfail(err_msg[:200])
+
+    def test_dot_kkt_transpose(self):
+        """K @ K^T with tl.trans — the fla chunk_scaled_dot_kkt pattern."""
+        torch.manual_seed(42)
+        T, D, BT = 32, 32, 32
+        K = torch.randn(T, D, device=DEVICE)
+        out = torch.zeros(BT, BT, device=DEVICE)
+        kkt_kernel[(1,)](K, out, T=T, D=D, BT=BT, num_warps=2)
+        torch.mps.synchronize()
+        ref = K.float() @ K.float().T
+        err = (out - ref).abs().max().item()
+        assert err < 1e-2, f"max_err={err}"
+
+    def test_dot_kkt_transpose_multi_block(self):
+        """K @ K^T with tl.trans, multiple program instances (blocks)."""
+        torch.manual_seed(42)
+        T, D, BT = 64, 32, 32
+        num_blocks = T // BT  # 2
+        K = torch.randn(T, D, device=DEVICE)
+        out = torch.zeros(num_blocks, BT, BT, device=DEVICE)
+        kkt_kernel[(num_blocks,)](K, out, T=T, D=D, BT=BT, num_warps=2)
+        torch.mps.synchronize()
+        ref = K.view(num_blocks, BT, D).float() @ K.view(num_blocks, BT, D).float().transpose(-1, -2)
+        for b in range(num_blocks):
+            err = (out[b] - ref[b]).abs().max().item()
+            assert err < 1e-2, f"block {b}: max_err={err}"
 
 
 class TestReduce:

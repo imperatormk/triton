@@ -63,7 +63,7 @@ public:
                   StringRef file, StringRef func, int line) const override;
 
   int getSharedAddressSpace() const override { return 3; } // threadgroup
-  int getAddressSpace(Attribute addressSpace) const override { return 0; }
+  int getAddressSpace(Attribute addressSpace) const override;
   bool supportVectorizedAtomics() const override { return false; }
 };
 

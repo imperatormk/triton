@@ -169,21 +169,6 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         // ── Get blocked encoding params for A, B, C ───────────────────────
 
-        // A and B may come through convert_layout (blocked→dot_op) or directly.
-        auto getBlockedVal = [&](Value tritonVal, Value adaptorVal) -> Value {
-            if (auto cvtOp = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>()) {
-                Value mapped = rewriter.getRemappedValue(cvtOp.getSrc());
-                if (mapped) return mapped;
-            }
-            return adaptorVal;
-        };
-
-        Value llvmA = getBlockedVal(op.getA(), adaptor.getA());
-        Value llvmB = getBlockedVal(op.getB(), adaptor.getB());
-        Value llvmC = adaptor.getC();
-        if (!llvmA || !llvmB || !llvmC)
-            return failure();
-
         // Unpack struct elements
         auto unpack = [&](Value v) -> SmallVector<Value> {
             SmallVector<Value> elems;
@@ -197,41 +182,60 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return elems;
         };
 
-        auto elemsA = unpack(llvmA);
-        auto elemsB = unpack(llvmB);
-        auto elemsC = unpack(llvmC);
-
-        // Get the blocked encoding for A and B.
-        // If convert_layout exists, use the source encoding; otherwise use directly.
-        auto getBlockedEnc = [](Value v) -> ttg::BlockedEncodingAttr {
-            if (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
-                auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
-                if (srcTy)
-                    return dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
+        // Resolve operand: get LLVM values, per-element offsets, and the
+        // blocked encoding needed for makeBase.
+        //
+        // Path 1 (convert_layout → DotOperandEncoding, identity pass-through):
+        //   Elements are in source blocked order. Look through the cvt to
+        //   get source LLVM values, use source blocked encoding for offsets.
+        //
+        // Path 2 (local_load → DotOperandEncoding, from optimize_dot_operands):
+        //   Elements are in DotOperandEncoding order (LinearLayout-based).
+        //   Use DotOperandEncoding for offsets, parent blocked for makeBase.
+        //
+        // Path 3 (direct blocked encoding):
+        //   Elements are in blocked order. Use blocked encoding for offsets.
+        auto resolveOperand = [&](Value tritonVal, Value adaptorVal,
+                                  RankedTensorType opTy)
+            -> std::tuple<SmallVector<Value>,
+                          SmallVector<SmallVector<unsigned>>,
+                          ttg::BlockedEncodingAttr> {
+            // Path 1: convert_layout — look through to source blocked values
+            if (auto cvt = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>()) {
+                Value mapped = rewriter.getRemappedValue(cvt.getSrc());
+                if (mapped) {
+                    auto srcTy = cast<RankedTensorType>(cvt.getSrc().getType());
+                    auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
+                    if (srcEnc) {
+                        auto offsets = emitOffsetForLayout(srcEnc, srcTy);
+                        return {unpack(mapped), offsets, srcEnc};
+                    }
+                }
             }
-            auto ty = dyn_cast<RankedTensorType>(v.getType());
-            if (ty) return dyn_cast<ttg::BlockedEncodingAttr>(ty.getEncoding());
-            return nullptr;
+            // Path 2: DotOperandEncoding (e.g. local_load after optimize_dot_operands)
+            auto enc = opTy.getEncoding();
+            if (auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(enc)) {
+                auto parentEnc = dyn_cast<ttg::BlockedEncodingAttr>(dotEnc.getParent());
+                if (parentEnc) {
+                    auto offsets = emitOffsetForLayout(enc, opTy);
+                    return {unpack(adaptorVal), offsets, parentEnc};
+                }
+            }
+            // Path 3: direct blocked encoding
+            if (auto blk = dyn_cast<ttg::BlockedEncodingAttr>(enc)) {
+                auto offsets = emitOffsetForLayout(blk, opTy);
+                return {unpack(adaptorVal), offsets, blk};
+            }
+            return {{}, {}, nullptr};
         };
 
-        auto aSrcEnc = getBlockedEnc(op.getA());
-        auto bSrcEnc = getBlockedEnc(op.getB());
+        auto [elemsA, aOffsets, aSrcEnc] = resolveOperand(op.getA(), adaptor.getA(), aType);
+        auto [elemsB, bOffsets, bSrcEnc] = resolveOperand(op.getB(), adaptor.getB(), bType);
+        auto elemsC = unpack(adaptor.getC());
+        auto cOffsets = emitOffsetForLayout(cEnc, cType);
+
         if (!aSrcEnc || !bSrcEnc)
             return failure();
-
-        // ── Compute per-thread element coordinates ────────────────────────
-        // Use emitOffsetForLayout (LinearLayout-based) to match the canonical
-        // element ordering used by ConvertLayoutOp.  getBlockedElemCoords
-        // ignored the encoding's order field, causing mismatches when a
-        // convert_layout followed the dot (e.g. trans epilogue).
-
-        // emitOffsetForLayout needs a RankedTensorType with the blocked encoding.
-        // aType/bType have DotOperandEncoding, so construct types with the source encoding.
-        auto aBlockedTy = RankedTensorType::get(aType.getShape(), aType.getElementType(), aSrcEnc);
-        auto bBlockedTy = RankedTensorType::get(bType.getShape(), bType.getElementType(), bSrcEnc);
-        auto aOffsets = emitOffsetForLayout(aSrcEnc, aBlockedTy);
-        auto bOffsets = emitOffsetForLayout(bSrcEnc, bBlockedTy);
-        auto cOffsets = emitOffsetForLayout(cEnc, cType);
 
         // Verify element counts match
         if ((int64_t)elemsA.size() != (int64_t)aOffsets.size() ||

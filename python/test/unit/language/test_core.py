@@ -3320,6 +3320,8 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         if device == 'mps':
             if out_dtype == 'float64' or in_dtype == 'float64':
                 pytest.skip("MPS does not support float64")
+            if in_dtype == 'int8':
+                pytest.skip("MPS does not support int8 MMA")
             if input_precision in ("tf32", "tf32x3", "bf16x3", "bf16x6"):
                 pytest.skip(f"MPS does not support {input_precision} input precision")
 

@@ -59,13 +59,15 @@ struct ConvertLayoutOpAppleConversion
         auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
         auto dstTy = cast<RankedTensorType>(op.getResult().getType());
 
-        // Case 1: DotOperandEncoding target — identity pass-through
+        // DotOperandEncoding target — identity pass-through.
+        // Our dot lowering looks through convert_layout to get source
+        // blocked values and uses blocked encoding for scatter/gather.
         if (isa<ttg::DotOperandEncodingAttr>(dstTy.getEncoding())) {
             rewriter.replaceOp(op, adaptor.getSrc());
             return success();
         }
 
-        // Case 2: blocked→blocked redistribution via TG scatter/gather
+        // blocked→blocked redistribution via TG scatter/gather
         auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
         auto dstEnc = dyn_cast<ttg::BlockedEncodingAttr>(dstTy.getEncoding());
         if (!srcEnc || !dstEnc)
