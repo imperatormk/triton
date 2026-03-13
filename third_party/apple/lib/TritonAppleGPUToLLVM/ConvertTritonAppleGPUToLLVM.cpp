@@ -150,13 +150,16 @@ struct ConvertLayoutOpAppleConversion
         // Use the largest strip height (multiple of 8) that fits in 32KB TG.
         // Fewer strips = fewer barriers = better performance.
         // Floor to rows when full tensor already fits.
-        // Account for global_smem (from allocate-shared-memory pass) which
-        // shares the 32KB TG budget.
+        // Account for global_smem (from allocate-shared-memory pass) and
+        // MMA dot TG buffers (from tt.dot pre-scan) in the 32KB TG budget.
         constexpr int64_t tgBudgetBytes = 32 * 1024;
         int64_t smemBytes = 0;
         if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
             smemBytes = attr.getValue().getZExtValue();
-        int64_t availBytes = tgBudgetBytes - smemBytes;
+        int64_t mmaBytes = 0;
+        if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.mma_shared"))
+            mmaBytes = attr.getValue().getZExtValue();
+        int64_t availBytes = tgBudgetBytes - smemBytes - mmaBytes;
         int64_t elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
         // Reserve 1 slot for garbage bin, then fit as many rows as possible
         int64_t maxStripRows = (availBytes / elemBytes - 1) / cols;
@@ -1651,6 +1654,28 @@ struct ConvertTritonAppleGPUToLLVMPass
                     "global_smem", /*value=*/Attribute(), /*alignment=*/16,
                     /*addrSpace=*/3u);
             }
+        }
+
+        // Pre-compute MMA threadgroup memory usage from tt.dot ops.
+        // Each dot creates a __tg_dot_ab TG buffer of (8*max(K,N)+1) floats.
+        // MetalASM coalesces all dot TG globals into one (taking the max),
+        // so total MMA TG cost = max over all dots.
+        // Set as module attribute so ConvertLayoutOp can account for it in
+        // the 32KB TG budget when sizing its own TG buffers.
+        {
+            int64_t maxMmaBytes = 0;
+            mod.walk([&](mlir::triton::DotOp dot) {
+                auto aType = cast<RankedTensorType>(dot.getA().getType());
+                auto cType = cast<RankedTensorType>(dot.getC().getType());
+                int64_t K = aType.getShape()[1];
+                int64_t N = cType.getShape()[1];
+                int64_t tgFloats = 8 * std::max(K, N) + 1;
+                int64_t tgBytes = tgFloats * 4;  // f32
+                maxMmaBytes = std::max(maxMmaBytes, tgBytes);
+            });
+            if (maxMmaBytes > 0)
+                mod->setAttr("ttg.mma_shared",
+                    IntegerAttr::get(IntegerType::get(ctx, 64), maxMmaBytes));
         }
 
         RewritePatternSet patterns(ctx);
