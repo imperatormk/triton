@@ -8,9 +8,11 @@ Dispatch pipeline:
     → lib.kernel_name(*args, threads=grid, group_size=block, arg_casts=...)
 """
 
+import re as _re
 import struct as _struct
 import torch
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
+from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -106,8 +108,18 @@ class MPSUtils:
                 "torch._C._mps_loadMetalllib not found — "
                 "rebuild PyTorch with the MPS patch (see mps-flash-attention repo)"
             )
-        module = torch._C._mps_loadMetalllib(bytes(metallib_bytes))
-        function = getattr(module, name)
+        try:
+            module = torch._C._mps_loadMetalllib(bytes(metallib_bytes))
+            function = getattr(module, name)
+        except RuntimeError as e:
+            msg = str(e)
+            # Metal PSO creation fails when threadgroup memory or thread count
+            # exceeds hardware limits. Raise OutOfResources so the autotuner
+            # skips this config instead of hard-erroring.
+            m = _re.search(r'Threadgroup (?:memory )?size \((\d+)\) exceeds the maximum .+ \((\d+)\)', msg)
+            if m:
+                raise OutOfResources(int(m.group(1)), int(m.group(2)), "Metal PSO") from e
+            raise
         return module, function, 0, 0, 1024
 
     def unload_module(self, module):
