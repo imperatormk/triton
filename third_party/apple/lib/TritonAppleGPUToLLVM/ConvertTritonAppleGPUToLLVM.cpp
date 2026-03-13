@@ -150,10 +150,16 @@ struct ConvertLayoutOpAppleConversion
         // Use the largest strip height (multiple of 8) that fits in 32KB TG.
         // Fewer strips = fewer barriers = better performance.
         // Floor to rows when full tensor already fits.
+        // Account for global_smem (from allocate-shared-memory pass) which
+        // shares the 32KB TG budget.
         constexpr int64_t tgBudgetBytes = 32 * 1024;
+        int64_t smemBytes = 0;
+        if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
+            smemBytes = attr.getValue().getZExtValue();
+        int64_t availBytes = tgBudgetBytes - smemBytes;
         int64_t elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
         // Reserve 1 slot for garbage bin, then fit as many rows as possible
-        int64_t maxStripRows = (tgBudgetBytes / elemBytes - 1) / cols;
+        int64_t maxStripRows = (availBytes / elemBytes - 1) / cols;
         maxStripRows = std::max<int64_t>(maxStripRows - (maxStripRows % 8), 8);  // round down to 8, min 8
         int64_t stripRows = std::min(maxStripRows, rows);
         int64_t tgStripSize = stripRows * cols;
