@@ -146,13 +146,24 @@ struct ConvertLayoutOpAppleConversion
         Value c32    = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
         Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
 
-        // Create TG global for scatter/gather
+        // Create TG global for tiled scatter/gather.
+        // Use the largest strip height (multiple of 8) that fits in 32KB TG.
+        // Fewer strips = fewer barriers = better performance.
+        // Floor to rows when full tensor already fits.
+        constexpr int64_t tgBudgetBytes = 32 * 1024;
+        int64_t elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+        // Reserve 1 slot for garbage bin, then fit as many rows as possible
+        int64_t maxStripRows = (tgBudgetBytes / elemBytes - 1) / cols;
+        maxStripRows = std::max<int64_t>(maxStripRows - (maxStripRows % 8), 8);  // round down to 8, min 8
+        int64_t stripRows = std::min(maxStripRows, rows);
+        int64_t tgStripSize = stripRows * cols;
+        int64_t tgSize = tgStripSize + 1;  // +1 garbage bin slot
         unsigned id = getCounter(ctx)++;
         std::string tgName = ("__tg_cvt_" + llvm::Twine(id)).str();
         {
             OpBuilder::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(mod.getBody());
-            auto arrTy = LLVMArrayType::get(elemTy, rows * cols);
+            auto arrTy = LLVMArrayType::get(elemTy, tgSize);
             LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
                                     Linkage::Internal, tgName, Attribute(), 4, 3u);
         }
@@ -266,10 +277,11 @@ struct ConvertLayoutOpAppleConversion
         auto [srcBaseRow, srcBaseCol, srcPred] = makeBase(srcEnc);
         auto [dstBaseRow, dstBaseCol, dstPred] = makeBase(dstEnc);
 
-        // Flat index helper
-        auto flatIdx = [&](Value bR, Value bC, int64_t rOff, int64_t cOff) -> Value {
+        // Strip flat index: row offset relative to strip start
+        auto stripFlatIdx = [&](Value bR, Value bC, int64_t rOff, int64_t cOff,
+                                int64_t stripRowStart) -> Value {
             Value r = arith::AddIOp::create(rewriter, loc, bR,
-                arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+                arith::ConstantIntOp::create(rewriter, loc, rOff - stripRowStart, 32));
             Value c = arith::AddIOp::create(rewriter, loc, bC,
                 arith::ConstantIntOp::create(rewriter, loc, cOff, 32));
             Value f = arith::AddIOp::create(rewriter, loc,
@@ -278,35 +290,72 @@ struct ConvertLayoutOpAppleConversion
             return arith::ExtUIOp::create(rewriter, loc, i64Ty, f);
         };
 
-        // Scatter source elements (guarded by in-bounds predicate)
-        {
-            auto [prevBlock, ifBlock, thenBlock] =
-                createIfBlock(rewriter, loc, srcPred);
-            (void)prevBlock;
-            rewriter.setInsertionPointToStart(ifBlock);
-            for (size_t i = 0; i < srcElems.size(); ++i) {
-                auto [rOff, cOff] = srcCoords[i];
-                Value idx = flatIdx(srcBaseRow, srcBaseCol, rOff, cOff);
-                Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{idx});
-                LLVM::StoreOp::create(rewriter, loc, srcElems[i], gep);
-            }
-            rewriter.setInsertionPointToStart(thenBlock);
-        }
-
-        // Barrier
         Value fenceTG = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
         Value execMod = arith::ConstantIntOp::create(rewriter, loc, 4, 32);
-        LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+        Value garbageIdx = arith::ConstantIntOp::create(rewriter, loc, tgStripSize, 64);
 
-        // Gather destination elements
-        SmallVector<Value> dstElems;
-        for (size_t i = 0; i < dstCoords.size(); ++i) {
-            auto [rOff, cOff] = dstCoords[i];
-            Value idx = flatIdx(dstBaseRow, dstBaseCol, rOff, cOff);
-            Value gep = LLVM::GEPOp::create(rewriter, loc,
-                tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{idx});
-            dstElems.push_back(LLVM::LoadOp::create(rewriter, loc, elemTy, gep).getResult());
+        // Initialize destination elements with undef (will be filled strip by strip)
+        SmallVector<Value> dstElems(dstCoords.size());
+        Value zeroElem = arith::ConstantOp::create(rewriter, loc, elemTy,
+            rewriter.getZeroAttr(elemTy));
+        for (size_t i = 0; i < dstElems.size(); ++i)
+            dstElems[i] = zeroElem;
+
+        // Tiled scatter/gather: process stripRows rows at a time.
+        // When rows*cols fits in 32KB, stripRows==rows → single pass (no overhead).
+        // Otherwise tiles down to fit, adding 2 barriers per extra strip.
+        int64_t numStrips = (rows + stripRows - 1) / stripRows;
+        for (int64_t strip = 0; strip < numStrips; ++strip) {
+            int64_t rowStart = strip * stripRows;
+            int64_t rowEnd = std::min(rowStart + stripRows, rows);
+
+            // Scatter source elements for this strip (garbage-bin for out-of-strip)
+            for (size_t i = 0; i < srcElems.size(); ++i) {
+                auto [rOff, cOff] = srcCoords[i];
+                Value actualRow = arith::AddIOp::create(rewriter, loc, srcBaseRow,
+                    arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+                Value inStrip = arith::AndIOp::create(rewriter, loc,
+                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
+                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
+                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
+                // Combine with in-bounds predicate
+                Value pred = arith::AndIOp::create(rewriter, loc, srcPred, inStrip);
+                Value idx = stripFlatIdx(srcBaseRow, srcBaseCol, rOff, cOff, rowStart);
+                Value safeIdx = arith::SelectOp::create(rewriter, loc, pred, idx, garbageIdx);
+                Value gep = LLVM::GEPOp::create(rewriter, loc,
+                    tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
+                LLVM::StoreOp::create(rewriter, loc, srcElems[i], gep);
+            }
+
+            // Barrier: all threads done scattering this strip
+            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+            // Gather destination elements for this strip.
+            // Use wrapped dstBaseRow (already < rows) for strip check — do NOT
+            // gate by dstPred. When tileM > rows, multiple threads wrap to the
+            // same row; all need the correct TG value regardless of dstPred.
+            for (size_t i = 0; i < dstCoords.size(); ++i) {
+                auto [rOff, cOff] = dstCoords[i];
+                Value actualRow = arith::AddIOp::create(rewriter, loc, dstBaseRow,
+                    arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+                Value inStrip = arith::AndIOp::create(rewriter, loc,
+                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
+                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
+                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
+                Value idx = stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
+                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
+                Value gep = LLVM::GEPOp::create(rewriter, loc,
+                    tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
+                Value gathered = LLVM::LoadOp::create(rewriter, loc, elemTy, gep).getResult();
+                // Use gathered value if in strip, keep previous otherwise
+                dstElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
+                    gathered, dstElems[i]);
+            }
+
+            // Barrier: all threads done gathering before next strip's scatter
+            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
         }
 
         // Pack result

@@ -691,23 +691,25 @@ class TestDot:
         err = (C - ref).abs().max().item()
         assert err < 1e-2, f"max_err={err}"
 
-    def test_dot_64x64_tg_limit(self):
-        """64x64 dot exceeds 32 KB TG memory limit on M1 (~72 KB needed)."""
-        try:
-            A = torch.randn(64, 64, device=DEVICE)
-            B = torch.randn(64, 64, device=DEVICE)
-            C = torch.zeros(64, 64, device=DEVICE)
-            dot_kernel[(1,)](A, B, C, 64, 64, 64)
-            torch.mps.synchronize()
-            ref = A @ B
-            err = (C - ref).abs().max().item()
-            assert err < 1e-1, f"max_err={err}"
-        except Exception as e:
-            err_msg = str(e)
-            if 'materializeAll' in err_msg or 'pipeline state' in err_msg.lower():
-                pytest.xfail('TG memory exceeds 32 KB limit (~72 KB needed)')
-            else:
-                pytest.xfail(err_msg[:200])
+    @pytest.mark.parametrize("M,N,K", [
+        (64, 64, 64),
+        (64, 64, 32),
+        (32, 64, 64),
+        (64, 32, 64),
+        (128, 128, 64),
+    ])
+    def test_dot_large_tiles(self, M, N, K):
+        """Large dot tiles that previously exceeded 32 KB TG limit.
+        Tiled TG scatter uses only 8*max(K,N)+1 floats (~2 KB for 64x64)."""
+        torch.manual_seed(42)
+        A = torch.randn(M, K, device=DEVICE)
+        B = torch.randn(K, N, device=DEVICE)
+        C = torch.zeros(M, N, device=DEVICE)
+        dot_kernel[(1,)](A, B, C, M, N, K)
+        torch.mps.synchronize()
+        ref = A @ B
+        err = (C - ref).abs().max().item()
+        assert err < 1e-1, f"{M}x{N}x{K}: max_err={err}"
 
     def test_dot_kkt_transpose(self):
         """K @ K^T with tl.trans — the fla chunk_scaled_dot_kkt pattern."""
