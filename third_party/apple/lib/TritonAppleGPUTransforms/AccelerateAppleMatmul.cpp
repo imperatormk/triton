@@ -69,14 +69,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
         auto cType = cast<RankedTensorType>(dot.getC().getType());
         auto aType = cast<RankedTensorType>(dot.getA().getType());
 
-        // Skip — keep BlockedEncoding on dot ops.
-        // AppleMmaEncoding rewrite causes verifier failures (Triton's
-        // DotOp verifier only accepts known parent layouts for DotOperandEncoding,
-        // and DialectInferLayoutInterface is not yet registered for Apple dialect).
-        // The DotOpToLLVM conversion handles BlockedEncoding dot ops directly.
-        (void)cType;
-        (void)aType;
-        return failure();
+        // Already converted — skip
+        if (isa<AppleMmaEncodingAttr>(cType.getEncoding()))
+            return failure();
 
         // Check supported element types
         if (!isSupportedDotType(aType.getElementType()))
@@ -87,34 +82,59 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
 
         int64_t M = shape[0], N = shape[1];
 
-        // Create AppleMmaEncoding
+        // Skip if tile doesn't divide evenly into 8×8 simdgroup tiles,
+        // or if too small for meaningful warp tiling.
+        if (M % 8 != 0 || N % 8 != 0) return failure();
+        if (M < 16 || N < 16) return failure();
+
+        // Create AppleMmaEncoding for the result only.
+        // A and B keep their blocked encoding — DotOpToLLVM handles the
+        // mismatch by scattering blocked inputs through TG while producing
+        // MMA-encoded output. Only one ConvertLayoutOp (result → blocked)
+        // is needed downstream, vs 4 if we converted all operands.
         auto wpc = warpsPerTileApple(M, N, numWarps);
+
+        int64_t K = aType.getShape()[1];
+
+        // Guard: core Triton's ConvertLayoutOp(mma→blocked) via shared memory
+        // produces wrong results for AppleMma when:
+        // - wpc is non-square (e.g. [2,1] from num_warps=2), or
+        // - K > 32 (large K dimension causes data corruption)
+        // Root cause is in transferSwizzlingLocalMemImpl's handling of our
+        // LinearLayout. Works correctly for square wpc with K ≤ 32.
+        // TODO: root-cause the core conversion issue for these cases.
+        if (wpc[0] != wpc[1]) return failure();
+        if (K > 32) return failure();
         auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
         auto newCType = RankedTensorType::get(shape, cType.getElementType(), mmaEnc);
 
-        // Keep A, B with AppleMmaEncoding (same as C) — DotOperandEncoding
-        // not used because Triton's verifier doesn't know AppleMmaEncoding
-        // as a valid DotOperandEncoding parent. The DotOpToLLVM conversion
-        // handles unblocking via the TG scatter/gather path.
-        auto newAType = RankedTensorType::get(aType.getShape(),
-                                              aType.getElementType(), mmaEnc);
-        auto newBType = RankedTensorType::get(
-            cast<RankedTensorType>(dot.getB().getType()).getShape(),
-            cast<RankedTensorType>(dot.getB().getType()).getElementType(), mmaEnc);
-
-        // Insert layout conversions for operands
         auto loc = dot.getLoc();
-        Value newA = ttg::ConvertLayoutOp::create(rewriter, loc, newAType, dot.getA());
-        Value newB = ttg::ConvertLayoutOp::create(rewriter, loc, newBType, dot.getB());
+
+        // If A/B have DotOperandEncoding, strip it back to plain blocked.
+        // DotOperandEncoding's parent must match the result encoding, but
+        // we're changing the result to AppleMma while keeping A/B blocked.
+        auto stripDotOpEnc = [&](Value operand) -> Value {
+            auto ty = cast<RankedTensorType>(operand.getType());
+            if (auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(ty.getEncoding())) {
+                auto parentTy = RankedTensorType::get(ty.getShape(),
+                    ty.getElementType(), dotEnc.getParent());
+                return ttg::ConvertLayoutOp::create(rewriter, loc, parentTy, operand);
+            }
+            return operand;
+        };
+        Value newA = stripDotOpEnc(dot.getA());
+        Value newB = stripDotOpEnc(dot.getB());
+
+        // Convert C to MMA encoding (it's the accumulator)
         Value newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
 
-        // Create new dot op with AppleMma encoding
+        // Create new dot: blocked A, blocked B, AppleMma C → AppleMma result
         auto newDot = tt::DotOp::create(rewriter,
             loc, newCType, newA, newB, newC,
             dot.getInputPrecisionAttr(), dot.getMaxNumImpreciseAccAttr());
 
-        // Convert output back to original encoding
+        // Convert result back to original blocked encoding for stores
         auto result = ttg::ConvertLayoutOp::create(rewriter,
             loc, cType, newDot.getResult());
 

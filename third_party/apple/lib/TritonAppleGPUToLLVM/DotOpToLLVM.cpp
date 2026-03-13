@@ -102,9 +102,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         auto cType = cast<RankedTensorType>(op.getC().getType());
         auto cEnc = dyn_cast<ttg::BlockedEncodingAttr>(cType.getEncoding());
-        if (!cEnc && !isa<AppleMmaEncodingAttr>(cType.getEncoding()))
-            return failure();
-        if (!cEnc)
+        auto cMmaEnc = dyn_cast<AppleMmaEncodingAttr>(cType.getEncoding());
+        if (!cEnc && !cMmaEnc)
             return failure();
 
         auto aType = cast<RankedTensorType>(op.getA().getType());
@@ -234,7 +233,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto [elemsA, aOffsets, aSrcEnc] = resolveOperand(op.getA(), adaptor.getA(), aType);
         auto [elemsB, bOffsets, bSrcEnc] = resolveOperand(op.getB(), adaptor.getB(), bType);
         auto elemsC = unpack(adaptor.getC());
-        auto cOffsets = emitOffsetForLayout(cEnc, cType);
+        auto cOffsets = emitOffsetForLayout(cType.getEncoding(), cType);
 
         if (!aSrcEnc || !bSrcEnc)
             return failure();
@@ -312,19 +311,50 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return {baseRow, baseCol};
         };
 
+        // MMA base: lane→(row,col) within 8x8 tile, warp→tile position
+        auto makeBaseMma = [&](AppleMmaEncodingAttr enc, int64_t rows, int64_t cols)
+            -> std::pair<Value, Value> {
+            auto wpc = enc.getWarpsPerCTA();
+            unsigned wN = wpc[1];
+
+            // Lane decomposition: col = laneId & 7, row_group = laneId >> 3
+            Value c7    = arith::ConstantIntOp::create(rewriter, loc, 7, 32);
+            Value c3    = arith::ConstantIntOp::create(rewriter, loc, 3, 32);
+            Value laneCol = arith::AndIOp::create(rewriter, loc, laneId, c7);
+            Value laneRow = arith::ShRUIOp::create(rewriter, loc, laneId, c3);
+
+            // Warp decomposition: warpRow = warpId / warpsN, warpCol = warpId % warpsN
+            Value wN_val  = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
+            Value c8      = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+            Value warpRow = arith::DivUIOp::create(rewriter, loc, warpId, wN_val);
+            Value warpCol = arith::RemUIOp::create(rewriter, loc, warpId, wN_val);
+
+            // baseRow = warpRow * 8 + laneRow, baseCol = warpCol * 8 + laneCol
+            Value baseRow = arith::AddIOp::create(rewriter, loc,
+                arith::MulIOp::create(rewriter, loc, warpRow, c8), laneRow);
+            Value baseCol = arith::AddIOp::create(rewriter, loc,
+                arith::MulIOp::create(rewriter, loc, warpCol, c8), laneCol);
+
+            return {baseRow, baseCol};
+        };
+
         auto [aBaseRow, aBaseCol] = makeBase(aSrcEnc, M, K);
         auto [bBaseRow, bBaseCol] = makeBase(bSrcEnc, K, N);
-        auto [cBaseRow, cBaseCol] = makeBase(cEnc, M, N);
+
+        Value cBaseRow, cBaseCol;
+        if (cEnc) {
+            std::tie(cBaseRow, cBaseCol) = makeBase(cEnc, M, N);
+        } else {
+            std::tie(cBaseRow, cBaseCol) = makeBaseMma(cMmaEnc, M, N);
+        }
 
         // ── Create threadgroup global ─────────────────────────────────────
-        // Tiled TG buffer: scatter/load 8 rows at a time.
-        // TG = 8 * max(K, N) + 1 floats — phases alias the same memory.
-        // The +1 is a garbage bin for out-of-strip stores.
-        // For 64×64×64: 513 floats ≈ 2 KB (vs 16 KB untiled).
+        // Single TG buffer reused across phases (A, C, B scatter + result gather).
+        // Size = 8 * max(K, N) + 1 (garbage bin slot).
 
         unsigned id = getCounter(ctx)++;
         int64_t tgStripSize = 8 * std::max(K, N);
-        int64_t tgSize = tgStripSize + 1;  // +1 garbage slot
+        int64_t tgSize = tgStripSize + 1;
         auto tgBuf = getOrCreateTGGlobal(rewriter, mod,
             ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
 
@@ -332,38 +362,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         // ── GEP helpers ───────────────────────────────────────────────────
 
-        // scatter1: store one f32 element to TG at flat index.
-        // stripRow subtracts the current strip origin so index is relative to TG buffer.
-        auto scatter1 = [&](Value ptr, Value val, Value flatIdx64) {
-            if (val.getType() != f32Ty)
-                val = arith::ExtFOp::create(rewriter, loc, f32Ty, val);
-            Value gep = LLVM::GEPOp::create(rewriter, loc,
-                tgPtrTy, f32Ty, ptr, ArrayRef<LLVM::GEPArg>{flatIdx64});
-            LLVM::StoreOp::create(rewriter, loc, val, gep);
-        };
-
         auto gather1 = [&](Value ptr, Value flatIdx64) -> Value {
             Value gep = LLVM::GEPOp::create(rewriter, loc,
                 tgPtrTy, f32Ty, ptr, ArrayRef<LLVM::GEPArg>{flatIdx64});
             return LLVM::LoadOp::create(rewriter, loc, f32Ty, gep).getResult();
         };
 
-        // flatIdx: (baseRow + rowOff) * stride + (baseCol + colOff)
-        auto flatIdx = [&](Value baseRow, Value baseCol,
-                           int64_t rowOff, int64_t colOff, int64_t stride) -> Value {
-            Value row32 = arith::AddIOp::create(rewriter, loc, baseRow,
-                arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
-            Value col32 = arith::AddIOp::create(rewriter, loc, baseCol,
-                arith::ConstantIntOp::create(rewriter, loc, colOff, 32));
-            Value flat32 = arith::AddIOp::create(rewriter, loc,
-                arith::MulIOp::create(rewriter, loc, row32,
-                    arith::ConstantIntOp::create(rewriter, loc, stride, 32)),
-                col32);
-            return arith::ExtUIOp::create(rewriter, loc, i64Ty, flat32);
-        };
-
-        // stripFlatIdx: like flatIdx but subtracts stripRowStart from row.
-        // Used for tiled scatter where TG holds only 8 rows starting at stripRowStart.
+        // stripFlatIdx: (baseRow + rowOff - stripRowStart) * stride + (baseCol + colOff)
         auto stripFlatIdx = [&](Value baseRow, Value baseCol,
                                 int64_t rowOff, int64_t colOff,
                                 int64_t stride, int64_t stripRowStart) -> Value {
@@ -382,19 +387,64 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         int64_t tilesN = N / 8;
         int64_t tilesK = K / 8;
 
-        // Garbage bin index — last slot in TG, used for out-of-strip stores.
+        // ── Static strip filtering ────────────────────────────────────────
+        // For each operand, compute the baseRow range from encoding params,
+        // then for each strip, precompute which element indices are possibly
+        // in range, avoiding runtime comparisons for elements that can never
+        // match.
+
+        // Compute max possible baseRow for a blocked encoding.
+        auto maxBaseRow = [](ttg::BlockedEncodingAttr enc) -> int64_t {
+            auto spt = enc.getSizePerThread();
+            auto tpw = enc.getThreadsPerWarp();
+            auto wpc = enc.getWarpsPerCTA();
+            return wpc[0] * tpw[0] * spt[0] - 1;
+        };
+
+        int64_t aMaxBase = maxBaseRow(aSrcEnc);
+        int64_t cMaxBase = maxBaseRow(cEnc ? cEnc : aSrcEnc);
+        int64_t bMaxBase = maxBaseRow(bSrcEnc);
+
+        // Pre-bucket: for each strip, which element indices could be in it?
+        // Element i is in strip [s, s+8) when baseRow + rowOff[i] ∈ [s, s+8),
+        // i.e. baseRow ∈ [s - rowOff[i], s - rowOff[i] + 8).
+        // Intersect with [0, maxBase] to check feasibility.
+        auto bucketElements = [](SmallVector<SmallVector<unsigned>> &offsets,
+                                 int64_t maxBase, int64_t numStrips)
+            -> SmallVector<SmallVector<size_t>> {
+            SmallVector<SmallVector<size_t>> buckets(numStrips);
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                int64_t rowOff = offsets[i][0];
+                for (int64_t s = 0; s < numStrips; ++s) {
+                    int64_t stripStart = s * 8;
+                    int64_t lo = stripStart - rowOff;
+                    int64_t hi = lo + 8;
+                    if (lo <= maxBase && hi > 0)
+                        buckets[s].push_back(i);
+                }
+            }
+            return buckets;
+        };
+
+        auto aBuckets = bucketElements(aOffsets, aMaxBase, tilesM);
+        auto cBuckets = bucketElements(cOffsets, cMaxBase, tilesM);
+        auto bBuckets = bucketElements(bOffsets, bMaxBase, tilesK);
+
+        // Garbage bin index (last slot in buffer)
         Value garbageIdx = arith::ConstantIntOp::create(rewriter, loc, tgStripSize, 64);
 
-        // Helper: scatter elements into TG for an 8-row strip [rowStart, rowStart+8).
-        // Out-of-strip elements store to the garbage bin slot (last TG float).
-        // This avoids CondBr (which creates too many basic blocks for Metal JIT).
-        auto stripScatter = [&](Value baseRow, Value baseCol,
-                                SmallVector<Value> &elems,
-                                SmallVector<SmallVector<unsigned>> &offsets,
-                                int64_t stride, int64_t rowStart) {
-            for (size_t i = 0; i < elems.size(); ++i) {
-                int64_t rowOff = offsets[i][0];
-                int64_t colOff = offsets[i][1];
+        // Filtered scatter: only processes elements in the bucket for this strip.
+        // Still uses garbage bin for runtime edge cases (multiple rowOffs mapping
+        // to same strip depending on baseRow).
+        auto filteredScatter = [&](Value ptr, Value garbIdx,
+                                   Value baseRow, Value baseCol,
+                                   SmallVector<Value> &elems,
+                                   SmallVector<SmallVector<unsigned>> &offsets,
+                                   SmallVector<size_t> &bucket,
+                                   int64_t stride, int64_t rowStart) {
+            for (size_t idx : bucket) {
+                int64_t rowOff = offsets[idx][0];
+                int64_t colOff = offsets[idx][1];
                 Value actualRow = arith::AddIOp::create(rewriter, loc, baseRow,
                     arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
                 Value inStrip = arith::AndIOp::create(rewriter, loc,
@@ -402,50 +452,27 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
                     arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
-                Value idx = stripFlatIdx(baseRow, baseCol, rowOff, colOff, stride, rowStart);
-                // Out-of-strip → store to garbage bin (no data corruption)
-                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
-                Value val = elems[i];
+                Value sIdx = stripFlatIdx(baseRow, baseCol, rowOff, colOff, stride, rowStart);
+                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbIdx);
+                Value val = elems[idx];
                 if (val.getType() != f32Ty)
                     val = arith::ExtFOp::create(rewriter, loc, f32Ty, val);
                 Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
+                    tgPtrTy, f32Ty, ptr, ArrayRef<LLVM::GEPArg>{safeIdx});
                 LLVM::StoreOp::create(rewriter, loc, val, gep);
             }
         };
 
-        // ── Phase 1: Load A tiles (8-row strips) ─────────────────────────
-        // For each tm: scatter A[tm*8..(tm+1)*8, 0..K] → TG[8×K], barrier,
-        //   load A[tm][tk] for all tk, barrier.
-        SmallVector<SmallVector<Value>> matA_tiles(tilesM);
-        for (int64_t tm = 0; tm < tilesM; ++tm) {
-            matA_tiles[tm].resize(tilesK);
-            int64_t rowStart = tm * 8;
-
-            stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart);
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-
-            // Load A[tm][tk] for all tk from TG[8×K]
-            for (int64_t tk = 0; tk < tilesK; ++tk) {
-                Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-                Value aStride = makeI64Vec2(rewriter, loc, 1, K);
-                Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
-                matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, loadFn,
-                    ValueRange{ptrTG, aShape, aStride, aOff}).getResult();
-            }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-        }
-
-        // ── Phase 2: Load C tiles (8-row strips) ─────────────────────────
+        // ── Phase 1: Load C tiles (filtered strip scatter) ────────────────
         SmallVector<SmallVector<Value>> matC_tiles(tilesM);
         for (int64_t tm = 0; tm < tilesM; ++tm) {
             matC_tiles[tm].resize(tilesN);
             int64_t rowStart = tm * 8;
 
-            stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart);
+            filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol,
+                            elemsC, cOffsets, cBuckets[tm], N, rowStart);
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-            // Load C[tm][tn] for all tn
             Value cStride = makeI64Vec2(rewriter, loc, 1, N);
             Value cShape  = makeI64Vec2(rewriter, loc, N, 8);
             for (int64_t tn = 0; tn < tilesN; ++tn) {
@@ -456,35 +483,59 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
         }
 
-        // ── Phase 3: B strips + MMA ──────────────────────────────────────
-        // For each tk: scatter B[tk*8..(tk+1)*8, 0..N] → TG[8×N], barrier,
-        //   load B[tk][tn], MMA: C[tm][tn] += A[tm][tk] * B[tk][tn].
+        // ── Phase 2: A/B strips + MMA (A loaded per-strip, not pre-loaded) ──
+        // Live matrices: tilesM × tilesN (C) + tilesM (A per strip) + 1 (B)
+        // Much less register pressure than pre-loading all A tiles.
         for (int64_t tk = 0; tk < tilesK; ++tk) {
-            int64_t rowStart = tk * 8;
-
-            stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart);
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-
-            // Load B[tk][tn] and MMA for all tm, tn
-            Value bStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
-            for (int64_t tn = 0; tn < tilesN; ++tn) {
-                Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
-                    ValueRange{ptrTG, bShape, bStride, bOff}).getResult();
-
+            // Load A tiles for this K-strip
+            SmallVector<Value> matA_strip(tilesM);
+            {
+                int64_t rowStartK = tk * 8;  // K-dim strip for B
+                // A strip: scatter A rows that map to this K-column strip.
+                // A[M, K]: for the MMA A[tm][tk], we need rows tm*8..(tm+1)*8,
+                // cols tk*8..(tk+1)*8. But A is scattered by M-strips.
+                // We need to scatter each M-strip of A separately.
                 for (int64_t tm = 0; tm < tilesM; ++tm) {
-                    matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
-                        ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                    int64_t rowStart = tm * 8;
+                    filteredScatter(ptrTG, garbageIdx, aBaseRow, aBaseCol,
+                                    elemsA, aOffsets, aBuckets[tm], K, rowStart);
+                    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                    Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
+                    Value aStride = makeI64Vec2(rewriter, loc, 1, K);
+                    Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
+                    matA_strip[tm] = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        ValueRange{ptrTG, aShape, aStride, aOff}).getResult();
+                    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
                 }
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+            // Load B tiles for this K-strip and MMA
+            {
+                int64_t rowStart = tk * 8;
+                filteredScatter(ptrTG, garbageIdx, bBaseRow, bBaseCol,
+                                elemsB, bOffsets, bBuckets[tk], N, rowStart);
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                Value bStride = makeI64Vec2(rewriter, loc, 1, N);
+                Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                    Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        ValueRange{ptrTG, bShape, bStride, bOff}).getResult();
+
+                    for (int64_t tm = 0; tm < tilesM; ++tm) {
+                        matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
+                            ValueRange{matA_strip[tm], matB, matC_tiles[tm][tn]}).getResult();
+                    }
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+            }
         }
 
-        // ── Phase 4: Store C tiles → TG (8-row strips), gather ──────────
+        // ── Phase 4: Store C tiles → TG, gather ─────────────────────────
         auto outElemTy = cType.getElementType();
         SmallVector<Value> resultElems(elemsC.size());
-        // Initialize to zero — overwritten by the correct strip's gather via select
         for (size_t i = 0; i < elemsC.size(); ++i)
             resultElems[i] = arith::ConstantOp::create(rewriter, loc,
                 rewriter.getZeroAttr(outElemTy));
@@ -492,7 +543,6 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         for (int64_t tm = 0; tm < tilesM; ++tm) {
             int64_t rowStart = tm * 8;
 
-            // Store C[tm][tn] for all tn to TG[8×N]
             Value cStoreStride = makeI64Vec2(rewriter, loc, 1, N);
             Value cStoreShape  = makeI64Vec2(rewriter, loc, N, 8);
             for (int64_t tn = 0; tn < tilesN; ++tn) {
@@ -502,11 +552,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             }
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-            // Gather: each thread reads its C elements that fall in this strip.
-            // Out-of-strip reads go to garbage bin; select keeps previous value.
-            for (size_t i = 0; i < elemsC.size(); ++i) {
-                int64_t rowOff = cOffsets[i][0];
-                int64_t colOff = cOffsets[i][1];
+            for (size_t idx : cBuckets[tm]) {
+                int64_t rowOff = cOffsets[idx][0];
+                int64_t colOff = cOffsets[idx][1];
                 Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
                     arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
                 Value inStrip = arith::AndIOp::create(rewriter, loc,
@@ -514,14 +562,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
                     arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
-                Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
-                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
+                Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
+                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
                 Value val = gather1(ptrTG, safeIdx);
                 if (val.getType() != outElemTy)
                     val = arith::TruncFOp::create(rewriter, loc, outElemTy, val);
-                // Select: use gathered value if in strip, keep previous otherwise
-                resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
-                    val, resultElems[i]);
+                resultElems[idx] = arith::SelectOp::create(rewriter, loc, inStrip,
+                    val, resultElems[idx]);
             }
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
         }

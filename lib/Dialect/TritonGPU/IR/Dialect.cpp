@@ -2708,6 +2708,11 @@ LogicalResult DotOperandEncodingAttr::verify(
     return success();
   }
 
+  // Generic MMA encoding (e.g. AppleMmaEncoding from out-of-tree backends)
+  if (mlir::isa<MmaEncodingTrait>(parent)) {
+    return success();
+  }
+
   return emitError() << "ttg.dot_op unexpected parent layout: " << parent;
 }
 

@@ -1,6 +1,11 @@
 // TritonAppleGPU dialect registration
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -11,6 +16,141 @@
 #define GET_ATTRDEF_CLASSES
 #include "Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
 
+namespace ttg = mlir::triton::gpu;
+using namespace mlir;
+using namespace mlir::triton;
+
+namespace {
+
+// DialectInferLayoutInterface for AppleMmaEncoding.
+// Delegates most operations to LinearLayout since AppleMmaEncodingAttr
+// already implements toLinearLayout().
+struct AppleGPUInferLayoutInterface
+    : public triton::DialectInferLayoutInterface {
+    using DialectInferLayoutInterface::DialectInferLayoutInterface;
+
+    LogicalResult
+    inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
+                          Attribute &resultEncoding,
+                          std::optional<Location> loc) const override {
+        resultEncoding = ttg::SliceEncodingAttr::get(
+            getDialect()->getContext(), axis,
+            cast<ttg::DistributedEncodingTrait>(operandEncoding));
+        return success();
+    }
+
+    LogicalResult
+    inferTransOpEncoding(Attribute operandEncoding, ArrayRef<int64_t> shape,
+                         ArrayRef<int32_t> order, Attribute &resultEncoding,
+                         std::optional<Location> loc) const override {
+        auto ll = ttg::toLinearLayout(shape, operandEncoding);
+        auto transposedLl = transposeLinearLayout(ll, order);
+        resultEncoding = ttg::LinearEncodingAttr::get(
+            getDialect()->getContext(), std::move(transposedLl));
+        return success();
+    }
+
+    LogicalResult
+    inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
+                              Attribute &resultEncoding,
+                              std::optional<Location> loc) const override {
+        auto sliceEncoding = mlir::dyn_cast<ttg::SliceEncodingAttr>(operandEncoding);
+        if (!sliceEncoding)
+            return emitOptionalError(
+                loc, "ExpandDimsOp operand encoding must be SliceEncodingAttr");
+        if (sliceEncoding.getDim() != axis)
+            return emitOptionalError(
+                loc, "Incompatible slice dimension for ExpandDimsOp operand");
+        resultEncoding = sliceEncoding.getParent();
+        return success();
+    }
+
+    LogicalResult
+    inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
+                       Attribute retEncoding,
+                       std::optional<Location> loc) const override {
+        if (auto dotOpEnc =
+                mlir::dyn_cast<ttg::DotOperandEncodingAttr>(operandEncoding)) {
+            if (opIdx != dotOpEnc.getOpIdx())
+                return emitOptionalError(loc, "Wrong opIdx");
+            if (retEncoding != dotOpEnc.getParent())
+                return emitOptionalError(loc, "Incompatible parent encoding");
+        }
+        return success();
+    }
+
+    LogicalResult
+    verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
+                                     Attribute operandEncodingB) const override {
+        auto aEnc = mlir::dyn_cast<ttg::DotOperandEncodingAttr>(operandEncodingA);
+        auto bEnc = mlir::dyn_cast<ttg::DotOperandEncodingAttr>(operandEncodingB);
+        if (!aEnc && !bEnc)
+            return success();
+        if (!aEnc || !bEnc)
+            return op->emitError("mismatching encoding between A and B operands");
+        if (aEnc.getKWidth() != bEnc.getKWidth())
+            return op->emitError("mismatching kWidth between A and B operands");
+        return success();
+    }
+
+    LogicalResult
+    inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
+                           ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                           std::optional<Location> loc) const override {
+        if (!isa<ttg::DistributedEncodingTrait>(srcEnc))
+            return emitOptionalError(loc,
+                "Failed MemDescReshapeOp encoding inference");
+        auto ctx = srcEnc.getContext();
+        auto i32Type = IntegerType::get(ctx, 32, IntegerType::Unsigned);
+        auto srcTy = RankedTensorType::get(srcShape, i32Type, srcEnc);
+        auto ll = ttg::inferReshapeLinearLayout(cast<ttg::TensorOrMemDesc>(srcTy), dstShape);
+        dstEnc = ttg::LinearEncodingAttr::get(ctx, std::move(ll));
+        return success();
+    }
+
+    LogicalResult
+    verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
+                          Attribute got,
+                          std::optional<Location> loc) const override {
+        if (expected == got)
+            return success();
+        if (!expected || !got)
+            return failure();
+        if (!ttg::areLayoutsEquivalent(
+                shape, cast<ttg::LayoutEncodingTrait>(expected),
+                cast<ttg::LayoutEncodingTrait>(got)))
+            return emitOptionalError(loc, "Expected result encoding ",
+                                     expected, " but was ", got);
+        return success();
+    }
+
+    LogicalResult
+    inferDefaultJoinOpEncoding(Attribute srcEnc, Attribute &dstEnc,
+                               ArrayRef<int64_t> shape,
+                               std::optional<Location> loc) const override {
+        return emitOptionalError(loc,
+            "JoinOp not yet supported for AppleMmaEncoding");
+    }
+
+    LogicalResult
+    inferSplitOpEncoding(Attribute srcEnc, Attribute &dstEnc,
+                         ArrayRef<int64_t> shape,
+                         std::optional<Location> loc) const override {
+        return emitOptionalError(loc,
+            "SplitOp not yet supported for AppleMmaEncoding");
+    }
+
+    LogicalResult
+    inferFp4ToFpOpEncoding(ArrayRef<int64_t> shape, int axis, Attribute inEnc,
+                           Attribute &outEnc, bool fwdInference,
+                           std::optional<Location> loc) const override {
+        return emitOptionalError(loc,
+            "Fp4ToFpOp not yet supported for AppleMmaEncoding");
+    }
+};
+
+} // anonymous namespace
+
 namespace mlir::triton::applegpu {
 
 void TritonAppleGPUDialect::initialize() {
@@ -19,6 +159,7 @@ void TritonAppleGPUDialect::initialize() {
 #define GET_ATTRDEF_LIST
 #include "Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
     >();
+    addInterfaces<AppleGPUInferLayoutInterface>();
 }
 
 void TritonAppleGPUDialect::registerTypes() {

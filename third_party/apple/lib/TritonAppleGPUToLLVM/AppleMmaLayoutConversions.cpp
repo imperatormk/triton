@@ -35,29 +35,46 @@ LinearLayout AppleMmaEncodingAttr::toLinearLayout(
 
     // ── Single 8×8 simdgroup tile ─────────────────────────────────────────
     //
-    // Basis: lane[0:2]→col, lane[3:4]→row, reg[0]→row+4
+    // Hardware mapping: lane[0:2]→col, lane[3:4]→row, reg[0]→row+4
     //
-    // identity1D(N, inDim, outDim):
-    //   consumes log2(N) bits of inDim, maps them to next log2(N) bits of outDim
-    LinearLayout ctaLayout =
-        LinearLayout::identity1D(8, S("lane"),     dimCol) *  // cols 0-7
-        LinearLayout::identity1D(4, S("lane"),     dimRow) *  // rows 0-3
-        LinearLayout::identity1D(2, S("register"), dimRow);   // rows 4-7
+    // Convention: "register" must be the first in-dim (asserted by
+    // ensureLayoutNotSmallerThan). We construct via explicit bases:
+    //
+    //   register bit 0 → row bit 2  (rows 0-3 vs 4-7)
+    //   lane bit 0     → col bit 0
+    //   lane bit 1     → col bit 1
+    //   lane bit 2     → col bit 2
+    //   lane bit 3     → row bit 0
+    //   lane bit 4     → row bit 1
+    std::vector<std::vector<int32_t>> registerBases = {
+        {4, 0}  // reg bit 0 → row=4, col=0
+    };
+    std::vector<std::vector<int32_t>> laneBases = {
+        {0, 1},  // lane bit 0 → row=0, col=1
+        {0, 2},  // lane bit 1 → row=0, col=2
+        {0, 4},  // lane bit 2 → row=0, col=4
+        {1, 0},  // lane bit 3 → row=1, col=0
+        {2, 0},  // lane bit 4 → row=2, col=0
+    };
+    LinearLayout ctaLayout(
+        SmallVector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>>{
+            {S("register"), registerBases}, {S("lane"), laneBases}},
+        SmallVector<StringAttr>{dimRow, dimCol});
 
     // ── Tile simdgroups across M and N ────────────────────────────────────
     auto wpc = getWarpsPerCTA();
     assert(wpc.size() == 2);
 
-    // Row-major warp tiling: [0]=M dim, [1]=N dim
-    SmallVector<unsigned> warpOrder{0, 1};
+    // Column-major warp tiling: warpId % wN → col, warpId / wN → row
+    SmallVector<unsigned> warpOrder{1, 0};
     ctaLayout *=
         identityStandardND(S("warp"), wpc, warpOrder)
             .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
 
     // ── Broadcast to full tensor shape ────────────────────────────────────
     // Handles shapes larger than one CTA tile by repeating the pattern.
-    // Apple has no CGA (cooperative group arrays) so pass empty CGALayout.
-    return combineCtaCgaWithShape(ctaLayout, CGAEncodingAttr{}, shape);
+    // Apple has no CGA — use trivial 1-CTA layout.
+    return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
 }
 
 } // namespace mlir::triton::applegpu

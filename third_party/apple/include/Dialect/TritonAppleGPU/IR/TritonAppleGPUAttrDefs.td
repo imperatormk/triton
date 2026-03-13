@@ -36,7 +36,8 @@ include "TritonAppleGPUDialect.td"
 
 def AppleMmaEncodingAttr : AttrDef<TritonAppleGPU_Dialect, "AppleMmaEncoding",
     [DeclareAttrInterfaceMethods<DistributedEncodingTrait>,
-     DeclareAttrInterfaceMethods<MmaEncodingTrait>]> {
+     DeclareAttrInterfaceMethods<MmaEncodingTrait>,
+     LayoutEncodingTrait]> {
 
   let mnemonic = "apple_mma";
 
@@ -75,6 +76,11 @@ def AppleMmaEncodingAttr : AttrDef<TritonAppleGPU_Dialect, "AppleMmaEncoding",
     }
 
     unsigned getRank() const { return getWarpsPerCTA().size(); }
+
+    // Required by LayoutEncodingTrait — Apple has no CGA (single CTA)
+    mlir::triton::gpu::CGAEncodingAttr getCGALayout() const {
+      return mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(getContext(), getRank());
+    }
 
     // Required by DistributedEncodingTrait
     SmallVector<unsigned> getThreadsPerWarp() const {
