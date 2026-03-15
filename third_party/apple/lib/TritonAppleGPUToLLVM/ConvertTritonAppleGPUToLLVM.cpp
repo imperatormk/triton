@@ -99,6 +99,10 @@ struct ConvertLayoutOpAppleConversion
         auto i64Ty   = IntegerType::get(ctx, 64);
         auto tgPtrTy = LLVMPointerType::get(ctx, 3);
 
+        // For pointer elements, use i64 in TG (Metal can't store ptrs in TG)
+        bool isPointerElem = isa<LLVMPointerType>(elemTy);
+        Type tgElemTy = isPointerElem ? i64Ty : elemTy;
+
         // Get lane/warp IDs (same helpers as DotOp)
         auto laneIdFnTy = LLVMFunctionType::get(i32Ty, {}, false);
         LLVMFuncOp laneIdFn;
@@ -160,7 +164,7 @@ struct ConvertLayoutOpAppleConversion
         if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.mma_shared"))
             mmaBytes = attr.getValue().getZExtValue();
         int64_t availBytes = tgBudgetBytes - smemBytes - mmaBytes;
-        int64_t elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+        int64_t elemBytes = isPointerElem ? 8 : elemTy.getIntOrFloatBitWidth() / 8;
         // Reserve 1 slot for garbage bin, then fit as many rows as possible
         int64_t maxStripRows = (availBytes / elemBytes - 1) / cols;
         maxStripRows = std::max<int64_t>(maxStripRows - (maxStripRows % 8), 8);  // round down to 8, min 8
@@ -172,9 +176,10 @@ struct ConvertLayoutOpAppleConversion
         {
             OpBuilder::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(mod.getBody());
-            auto arrTy = LLVMArrayType::get(elemTy, tgSize);
+            auto arrTy = LLVMArrayType::get(tgElemTy, tgSize);
             LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
-                                    Linkage::Internal, tgName, Attribute(), 4, 3u);
+                                    Linkage::Internal, tgName, Attribute(),
+                                    isPointerElem ? 8 : 4, 3u);
         }
         auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
         Value tgPtr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgGlobal.getName());
@@ -305,8 +310,14 @@ struct ConvertLayoutOpAppleConversion
 
         // Initialize destination elements with undef (will be filled strip by strip)
         SmallVector<Value> dstElems(dstCoords.size());
-        Value zeroElem = arith::ConstantOp::create(rewriter, loc, elemTy,
-            rewriter.getZeroAttr(elemTy));
+        Value zeroElem;
+        if (isPointerElem) {
+            Value zeroInt = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
+            zeroElem = LLVM::IntToPtrOp::create(rewriter, loc, elemTy, zeroInt);
+        } else {
+            zeroElem = arith::ConstantOp::create(rewriter, loc, elemTy,
+                rewriter.getZeroAttr(elemTy));
+        }
         for (size_t i = 0; i < dstElems.size(); ++i)
             dstElems[i] = zeroElem;
 
@@ -333,8 +344,11 @@ struct ConvertLayoutOpAppleConversion
                 Value idx = stripFlatIdx(srcBaseRow, srcBaseCol, rOff, cOff, rowStart);
                 Value safeIdx = arith::SelectOp::create(rewriter, loc, pred, idx, garbageIdx);
                 Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
-                LLVM::StoreOp::create(rewriter, loc, srcElems[i], gep);
+                    tgPtrTy, tgElemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
+                Value toStore = srcElems[i];
+                if (isPointerElem)
+                    toStore = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, toStore);
+                LLVM::StoreOp::create(rewriter, loc, toStore, gep);
             }
 
             // Barrier: all threads done scattering this strip
@@ -356,8 +370,10 @@ struct ConvertLayoutOpAppleConversion
                 Value idx = stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
                 Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
                 Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, elemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
-                Value gathered = LLVM::LoadOp::create(rewriter, loc, elemTy, gep).getResult();
+                    tgPtrTy, tgElemTy, tgPtr, ArrayRef<LLVM::GEPArg>{safeIdx});
+                Value gathered = LLVM::LoadOp::create(rewriter, loc, tgElemTy, gep).getResult();
+                if (isPointerElem)
+                    gathered = LLVM::IntToPtrOp::create(rewriter, loc, elemTy, gathered);
                 // Use gathered value if in strip, keep previous otherwise
                 dstElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
                     gathered, dstElems[i]);
