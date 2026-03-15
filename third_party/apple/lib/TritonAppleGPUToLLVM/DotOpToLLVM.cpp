@@ -383,13 +383,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         // Compute runtime batch-offset pointer for SIMD matrix load/store.
         // Each batch slice gets its own tgStripSize region in TG memory so
-        // MMA ops don't cross-contaminate between warps of different batches.
-        // ptrTGBatch = ptrTG + (warpId / (wM_c * wN_c)) * tgStripSize
+        // MMA ops don't cross-contaminate between warps assigned to different batches.
+        //
+        // numBatchWarps = numTotalWarps / matWarpsC.
+        // When batchSize > numBatchWarps, we must process multiple batches
+        // per warp via an unrolled batch loop (see below).
+        auto cWpc = cEnc.getWarpsPerCTA();
+        int64_t matWarpsC = cWpc[rowDim] * cWpc[colDim];
+        int64_t numTotalWarps = 1;
+        for (auto w : cWpc) numTotalWarps *= w;
+        int64_t numBatchWarps = numTotalWarps / matWarpsC;
+
         Value ptrTGBatch = ptrTG;
         Value batchTGOffset64 = arith::ConstantIntOp::create(rewriter, loc, (int64_t)0, 64);
-        if (batchSize > 1) {
-            auto cWpc = cEnc.getWarpsPerCTA();
-            int64_t matWarpsC = cWpc[rowDim] * cWpc[colDim];
+        if (batchSize > 1 && numBatchWarps >= batchSize) {
             Value mwc = arith::ConstantIntOp::create(rewriter, loc, matWarpsC, 32);
             Value batchWarpIdx = arith::DivUIOp::create(rewriter, loc, warpId, mwc);
             Value batchOff32 = arith::MulIOp::create(rewriter, loc, batchWarpIdx,
@@ -397,6 +404,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             batchTGOffset64 = arith::ExtUIOp::create(rewriter, loc, i64Ty, batchOff32);
             ptrTGBatch = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty,
                 ptrTG, ArrayRef<LLVM::GEPArg>{batchTGOffset64});
+        } else if (batchSize > 1) {
+            // Insufficient batch warps — ptrTGBatch will be set per-batch
+            // in the unrolled batch loop below.
         }
 
         // ── GEP helpers ───────────────────────────────────────────────────
@@ -511,109 +521,141 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             resultElems[i] = arith::ConstantOp::create(rewriter, loc,
                 rewriter.getZeroAttr(outElemTy));
 
-        // ── Single pass: no batch loop ──────────────────────────────────
-        // Each thread's elements are scattered to per-batch TG regions.
-        // SIMD load/store uses ptrTGBatch (warp's batch region).
-        // All batches are processed simultaneously.
+        // ── MMA computation (batch-aware) ─────────────────────────────
+        // When numBatchWarps >= batchSize, each warp handles one batch
+        // (ptrTGBatch already points to that batch's TG region) — single pass.
+        // When numBatchWarps < batchSize, process batches sequentially:
+        // each iteration sets ptrTGBatch for batch b's TG region and
+        // does scatter/MMA/gather for that batch.
 
-        // Phase 1: Load A tiles (8-row strips)
-        SmallVector<SmallVector<Value>> matA_tiles(tilesM);
-        for (int64_t tm = 0; tm < tilesM; ++tm) {
-            matA_tiles[tm].resize(tilesK);
-            int64_t rowStart = tm * 8;
+        // Determine how many rounds of batch processing we need.
+        // Normal: 1 round (all batches handled by warp assignment).
+        // Fallback: batchSize rounds (one per batch).
+        int64_t batchRounds = 1;
+        if (batchSize > 1 && numBatchWarps < batchSize)
+            batchRounds = batchSize;
 
-            stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed);
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-
-            for (int64_t tk = 0; tk < tilesK; ++tk) {
-                Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-                Value aStride = makeI64Vec2(rewriter, loc, 1, K);
-                Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
-                matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, loadFn,
-                    ValueRange{ptrTGBatch, aShape, aStride, aOff}).getResult();
+        for (int64_t batchRound = 0; batchRound < batchRounds; ++batchRound) {
+            // For the sequential fallback, update ptrTGBatch and batchTGOffset64
+            // to point to the current batch's TG region.
+            Value curPtrTGBatch = ptrTGBatch;
+            if (batchRounds > 1) {
+                Value bOff64 = arith::ConstantIntOp::create(rewriter, loc,
+                    (int64_t)(batchRound * tgStripSize), 64);
+                curPtrTGBatch = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty,
+                    ptrTG, ArrayRef<LLVM::GEPArg>{bOff64});
+                batchTGOffset64 = bOff64;
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-        }
 
-        // Phase 2: Load C tiles (8-row strips)
-        SmallVector<SmallVector<Value>> matC_tiles(tilesM);
-        for (int64_t tm = 0; tm < tilesM; ++tm) {
-            matC_tiles[tm].resize(tilesN);
-            int64_t rowStart = tm * 8;
+            // Phase 1: Load A tiles (8-row strips)
+            SmallVector<SmallVector<Value>> matA_tiles(tilesM);
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+                matA_tiles[tm].resize(tilesK);
+                int64_t rowStart = tm * 8;
 
-            stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, false);
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed);
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-            Value cStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value cShape  = makeI64Vec2(rewriter, loc, N, 8);
-            for (int64_t tn = 0; tn < tilesN; ++tn) {
-                Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, loadFn,
-                    ValueRange{ptrTGBatch, cShape, cStride, cOff}).getResult();
-            }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-        }
-
-        // Phase 3: B strips + MMA
-        for (int64_t tk = 0; tk < tilesK; ++tk) {
-            int64_t rowStart = tk * 8;
-
-            stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed);
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-
-            Value bStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
-            for (int64_t tn = 0; tn < tilesN; ++tn) {
-                Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
-                    ValueRange{ptrTGBatch, bShape, bStride, bOff}).getResult();
-
-                for (int64_t tm = 0; tm < tilesM; ++tm) {
-                    matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
-                        ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                for (int64_t tk = 0; tk < tilesK; ++tk) {
+                    Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
+                    Value aStride = makeI64Vec2(rewriter, loc, 1, K);
+                    Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
+                    matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        ValueRange{curPtrTGBatch, aShape, aStride, aOff}).getResult();
                 }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-        }
 
-        // Phase 4: Store C tiles -> TG (8-row strips), gather
-        for (int64_t tm = 0; tm < tilesM; ++tm) {
-            int64_t rowStart = tm * 8;
+            // Phase 2: Load C tiles (8-row strips)
+            SmallVector<SmallVector<Value>> matC_tiles(tilesM);
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+                matC_tiles[tm].resize(tilesN);
+                int64_t rowStart = tm * 8;
 
-            Value cStoreStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value cStoreShape  = makeI64Vec2(rewriter, loc, N, 8);
-            for (int64_t tn = 0; tn < tilesN; ++tn) {
-                Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                LLVM::CallOp::create(rewriter, loc, storeFn,
-                    ValueRange{matC_tiles[tm][tn], ptrTGBatch, cStoreShape, cStoreStride, cOff});
+                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, false);
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                Value cStride = makeI64Vec2(rewriter, loc, 1, N);
+                Value cShape  = makeI64Vec2(rewriter, loc, N, 8);
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                    matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        ValueRange{curPtrTGBatch, cShape, cStride, cOff}).getResult();
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-            // Gather: each thread reads its C elements from its batch's TG region.
-            for (size_t i = 0; i < elemsC.size(); ++i) {
-                int64_t rowOff = cOffsets[i][rowDim];
-                int64_t colOff = cOffsets[i][colDim];
-                Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
-                    arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
-                Value inStrip = arith::AndIOp::create(rewriter, loc,
-                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
-                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
-                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
-                Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
-                // Add batch TG offset to read from the correct batch region.
-                // C always uses runtime warp-based batch offset (uniform offsets).
-                Value batchOff = elemBatchTGOffset(cOffsets, i, false);
-                Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
-                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
-                Value val = gather1(ptrTG, safeIdx);
-                if (val.getType() != outElemTy)
-                    val = fromF32(rewriter, loc, val, outElemTy);
-                resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
-                    val, resultElems[i]);
+            // Phase 3: B strips + MMA
+            for (int64_t tk = 0; tk < tilesK; ++tk) {
+                int64_t rowStart = tk * 8;
+
+                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed);
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                Value bStride = makeI64Vec2(rewriter, loc, 1, N);
+                Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                    Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        ValueRange{curPtrTGBatch, bShape, bStride, bOff}).getResult();
+
+                    for (int64_t tm = 0; tm < tilesM; ++tm) {
+                        matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
+                            ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                    }
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
-        }
+
+            // Phase 4: Store C tiles -> TG (8-row strips), gather
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+                int64_t rowStart = tm * 8;
+
+                Value cStoreStride = makeI64Vec2(rewriter, loc, 1, N);
+                Value cStoreShape  = makeI64Vec2(rewriter, loc, N, 8);
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                    LLVM::CallOp::create(rewriter, loc, storeFn,
+                        ValueRange{matC_tiles[tm][tn], curPtrTGBatch, cStoreShape, cStoreStride, cOff});
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                // Gather: each thread reads its C elements from its batch's TG region.
+                for (size_t i = 0; i < elemsC.size(); ++i) {
+                    // In sequential batch mode, skip elements not in current batch.
+                    if (batchRounds > 1 && rowDim > 0) {
+                        int64_t elemBatch = 0;
+                        int64_t stride = 1;
+                        for (int d = (int)rowDim - 1; d >= 0; --d) {
+                            elemBatch += cOffsets[i][d] * stride;
+                            stride *= cType.getShape()[d];
+                        }
+                        if (elemBatch != batchRound) continue;
+                    }
+                    int64_t rowOff = cOffsets[i][rowDim];
+                    int64_t colOff = cOffsets[i][colDim];
+                    Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
+                        arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
+                    Value inStrip = arith::AndIOp::create(rewriter, loc,
+                        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
+                            actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+                        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
+                            actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
+                    Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
+                    // Add batch TG offset to read from the correct batch region.
+                    // C always uses runtime warp-based batch offset (uniform offsets).
+                    Value batchOff = elemBatchTGOffset(cOffsets, i, false);
+                    Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
+                    Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
+                    Value val = gather1(ptrTG, safeIdx);
+                    if (val.getType() != outElemTy)
+                        val = fromF32(rewriter, loc, val, outElemTy);
+                    resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
+                        val, resultElems[i]);
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+            }
+        }  // end batchRound loop
 
         // ── Pack result ───────────────────────────────────────────────────
         auto outLLVMTy = getTypeConverter()->convertType(cType);

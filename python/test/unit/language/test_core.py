@@ -3320,8 +3320,6 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         if device == 'mps':
             if out_dtype == 'float64' or in_dtype == 'float64':
                 pytest.skip("MPS does not support float64")
-            if in_dtype == 'int8':
-                pytest.skip("MPS does not support int8 MMA")
             if input_precision in ("tf32", "tf32x3", "bf16x3", "bf16x6"):
                 pytest.skip(f"MPS does not support {input_precision} input precision")
 
@@ -3575,6 +3573,8 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
                           for mma in (mma_nonk_sizes if is_hip() else [16])
                           for kpack in ([1, 2] if (is_hip() and not (is_hip_cdna4() or is_hip_gfx1250())) else [1])])
 def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack, device):
+    if device == 'mps':
+        pytest.skip("MPS does not support FP8 scaled dot")
     is_SM120 = False
     if is_cuda():
         cc = torch.cuda.get_device_capability()
