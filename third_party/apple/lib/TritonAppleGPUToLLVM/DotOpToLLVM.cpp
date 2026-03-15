@@ -394,19 +394,37 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         for (auto w : cWpc) numTotalWarps *= w;
         int64_t numBatchWarps = numTotalWarps / matWarpsC;
 
+        // Compute per-operand batch warp index (runtime).
+        // batchWarpIdx = warpId / matWarps, where matWarps is the product
+        // of warpsPerCTA for the row and col dims of each operand's encoding.
+        // This determines which batch slice each warp handles.
+        auto makeBatchWarpIdx = [&](ttg::BlockedEncodingAttr enc) -> Value {
+            auto wpc = enc.getWarpsPerCTA();
+            unsigned encRank = wpc.size();
+            unsigned encRowDim = encRank - 2;
+            unsigned encColDim = encRank - 1;
+            int64_t matW = wpc[encRowDim] * wpc[encColDim];
+            int64_t batchW = 1;
+            for (unsigned d = 0; d < encRowDim; ++d) batchW *= wpc[d];
+            if (batchW <= 1)
+                return arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+            Value mw = arith::ConstantIntOp::create(rewriter, loc, matW, 32);
+            return arith::DivUIOp::create(rewriter, loc, warpId, mw);
+        };
+
+        Value cBatchWarpIdx = makeBatchWarpIdx(cEnc);
+        Value aBatchWarpIdx = makeBatchWarpIdx(aSrcEnc);
+        Value bBatchWarpIdx = makeBatchWarpIdx(bSrcEnc);
+
         Value ptrTGBatch = ptrTG;
         Value batchTGOffset64 = arith::ConstantIntOp::create(rewriter, loc, (int64_t)0, 64);
         if (batchSize > 1 && numBatchWarps >= batchSize) {
-            Value mwc = arith::ConstantIntOp::create(rewriter, loc, matWarpsC, 32);
-            Value batchWarpIdx = arith::DivUIOp::create(rewriter, loc, warpId, mwc);
-            Value batchOff32 = arith::MulIOp::create(rewriter, loc, batchWarpIdx,
+            // Warp-distributed: each warp handles one batch via C's batchWarpIdx.
+            Value batchOff32 = arith::MulIOp::create(rewriter, loc, cBatchWarpIdx,
                 arith::ConstantIntOp::create(rewriter, loc, tgStripSize, 32));
             batchTGOffset64 = arith::ExtUIOp::create(rewriter, loc, i64Ty, batchOff32);
             ptrTGBatch = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty,
                 ptrTG, ArrayRef<LLVM::GEPArg>{batchTGOffset64});
-        } else if (batchSize > 1) {
-            // Insufficient batch warps — ptrTGBatch will be set per-batch
-            // in the unrolled batch loop below.
         }
 
         // ── GEP helpers ───────────────────────────────────────────────────
@@ -441,10 +459,26 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         Value garbageIdx = arith::ConstantIntOp::create(rewriter, loc,
             tgStripSize * batchSize, 64);
 
-        // Helper: determine if an operand's offsets have mixed batch values
-        // (i.e., the offsets explicitly encode the global batch index).
-        // If all offsets have the same batch value, the batch is determined
-        // by the runtime warpId (warp-distributed batch).
+        // Determine if an operand has batch warps (runtime batch component).
+        // If wpc[0] == 1, all batches are in compile-time offsets (no runtime batch).
+        // If wpc[0] > 1, batch is partially runtime (batchWarpIdx contributes).
+        auto hasBatchWarps = [&](ttg::BlockedEncodingAttr enc) -> bool {
+            if (rowDim == 0) return false;
+            auto wpc = enc.getWarpsPerCTA();
+            int64_t bw = 1;
+            for (unsigned d = 0; d < rowDim; ++d) bw *= wpc[d];
+            return bw > 1;
+        };
+
+        // "hasBatchWarps" means the operand needs runtime batch filtering
+        // in sequential mode. If false, compile-time elemBatchIndex covers
+        // all batches and compile-time filtering suffices.
+        bool aHasBatchWarps = hasBatchWarps(aSrcEnc);
+        bool bHasBatchWarps = hasBatchWarps(bSrcEnc);
+        bool cHasBatchWarps = hasBatchWarps(cEnc);
+
+        // For warp-distributed mode (TG offset routing), we still need to know
+        // if offsets have mixed batch values for the TG offset computation.
         auto hasMixedBatches = [&](const SmallVector<SmallVector<unsigned>> &offsets) -> bool {
             if (rowDim == 0 || offsets.empty()) return false;
             for (size_t i = 1; i < offsets.size(); ++i) {
@@ -458,7 +492,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         bool aMixed = hasMixedBatches(aOffsets);
         bool bMixed = hasMixedBatches(bOffsets);
-        // C (blocked encoding) typically has all-same batch offsets.
+        bool cMixed = hasMixedBatches(cOffsets);
 
         // Helper: compute the TG batch offset for an element.
         // For operands with mixed batch offsets (e.g. dot_op A/B), use the
@@ -484,15 +518,43 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return batchTGOffset64;
         };
 
+        // Helper: compute flat batch index for element i from compile-time offsets.
+        auto elemBatchIndex = [&](const SmallVector<SmallVector<unsigned>> &offsets,
+                                  size_t i) -> int64_t {
+            int64_t batchIdx = 0;
+            int64_t stride = 1;
+            for (int d = (int)rowDim - 1; d >= 0; --d) {
+                batchIdx += offsets[i][d] * stride;
+                stride *= cType.getShape()[d];
+            }
+            return batchIdx;
+        };
+
         // Helper: scatter elements into TG for an 8-row strip.
-        // No batch filtering — all elements are scattered, each to its own
-        // batch region based on elemBatchTGOffset.
+        // In sequential batch mode (curBatchRound >= 0), only scatter elements
+        // matching the current batch. Data goes to TG base (no per-batch regions).
+        // For operands without batch warps: compile-time filter by elemBatchIndex.
+        // For operands with batch warps: runtime filter using batchWarpIdx.
+        // In warp-distributed mode (curBatchRound < 0), scatter all elements,
+        // each to its own batch region based on elemBatchTGOffset.
         auto stripScatter = [&](Value baseRow, Value baseCol,
                                 SmallVector<Value> &elems,
                                 SmallVector<SmallVector<unsigned>> &offsets,
                                 int64_t stride, int64_t rowStart,
-                                bool mixed) {
+                                bool mixed, int64_t curBatchRound,
+                                Value operandBatchWarpIdx,
+                                bool opHasBatchWarps) {
             for (size_t i = 0; i < elems.size(); ++i) {
+                int64_t eb = (rowDim > 0) ? elemBatchIndex(offsets, i) : 0;
+
+                // In sequential batch mode, skip elements not in current batch.
+                if (curBatchRound >= 0 && rowDim > 0 && !opHasBatchWarps) {
+                    // No batch warps: compile-time batch index IS the actual batch.
+                    if (eb != curBatchRound) continue;
+                }
+                // For operands WITH batch warps: can't skip at compile time.
+                // Runtime check is added below.
+
                 int64_t rowOff = offsets[i][rowDim];
                 int64_t colOff = offsets[i][colDim];
                 Value actualRow = arith::AddIOp::create(rewriter, loc, baseRow,
@@ -502,15 +564,36 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
                     arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
+
+                // For operands with batch warps in sequential mode, add runtime batch check.
+                // actual batch = elemBatchIndex + batchWarpIdx
+                // match condition: batchWarpIdx == curBatchRound - elemBatchIndex
+                if (curBatchRound >= 0 && rowDim > 0 && opHasBatchWarps) {
+                    Value targetBatchWarp = arith::ConstantIntOp::create(rewriter, loc,
+                        curBatchRound - eb, 32);
+                    Value batchMatch = arith::CmpIOp::create(rewriter, loc,
+                        arith::CmpIPredicate::eq, operandBatchWarpIdx, targetBatchWarp);
+                    inStrip = arith::AndIOp::create(rewriter, loc, inStrip, batchMatch);
+                }
+
                 Value idx = stripFlatIdx(baseRow, baseCol, rowOff, colOff, stride, rowStart);
-                // Add per-element batch TG offset.
-                Value batchOff = elemBatchTGOffset(offsets, i, mixed);
-                Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
-                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
-                Value val = toF32(rewriter, loc, elems[i], f32Ty);
-                Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
-                LLVM::StoreOp::create(rewriter, loc, val, gep);
+                if (curBatchRound >= 0) {
+                    // Sequential mode: all data goes to TG base.
+                    Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
+                    Value val = toF32(rewriter, loc, elems[i], f32Ty);
+                    Value gep = LLVM::GEPOp::create(rewriter, loc,
+                        tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
+                    LLVM::StoreOp::create(rewriter, loc, val, gep);
+                } else {
+                    // Warp-distributed mode: add per-element batch TG offset.
+                    Value batchOff = elemBatchTGOffset(offsets, i, mixed);
+                    Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
+                    Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
+                    Value val = toF32(rewriter, loc, elems[i], f32Ty);
+                    Value gep = LLVM::GEPOp::create(rewriter, loc,
+                        tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
+                    LLVM::StoreOp::create(rewriter, loc, val, gep);
+                }
             }
         };
 
@@ -524,27 +607,21 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // ── MMA computation (batch-aware) ─────────────────────────────
         // When numBatchWarps >= batchSize, each warp handles one batch
         // (ptrTGBatch already points to that batch's TG region) — single pass.
-        // When numBatchWarps < batchSize, process batches sequentially:
-        // each iteration sets ptrTGBatch for batch b's TG region and
-        // does scatter/MMA/gather for that batch.
+        // When numBatchWarps < batchSize, process one batch per round.
+        // Each round: scatter/load/MMA/store/gather for a single batch.
+        // All data goes to TG base (single region). Runtime batch filtering
+        // ensures only the correct batch's data is scattered.
 
-        // Determine how many rounds of batch processing we need.
-        // Normal: 1 round (all batches handled by warp assignment).
-        // Fallback: batchSize rounds (one per batch).
         int64_t batchRounds = 1;
         if (batchSize > 1 && numBatchWarps < batchSize)
             batchRounds = batchSize;
 
         for (int64_t batchRound = 0; batchRound < batchRounds; ++batchRound) {
-            // For the sequential fallback, update ptrTGBatch and batchTGOffset64
-            // to point to the current batch's TG region.
             Value curPtrTGBatch = ptrTGBatch;
+            int64_t scatterBatchRound = -1; // -1 = warp-distributed (no filter)
             if (batchRounds > 1) {
-                Value bOff64 = arith::ConstantIntOp::create(rewriter, loc,
-                    (int64_t)(batchRound * tgStripSize), 64);
-                curPtrTGBatch = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty,
-                    ptrTG, ArrayRef<LLVM::GEPArg>{bOff64});
-                batchTGOffset64 = bOff64;
+                curPtrTGBatch = ptrTG; // sequential: single TG region at base
+                scatterBatchRound = batchRound;
             }
 
             // Phase 1: Load A tiles (8-row strips)
@@ -553,7 +630,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 matA_tiles[tm].resize(tilesK);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed);
+                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed, scatterBatchRound, aBatchWarpIdx, aHasBatchWarps);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 for (int64_t tk = 0; tk < tilesK; ++tk) {
@@ -572,7 +649,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 matC_tiles[tm].resize(tilesN);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, false);
+                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, cMixed, scatterBatchRound, cBatchWarpIdx, cHasBatchWarps);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 Value cStride = makeI64Vec2(rewriter, loc, 1, N);
@@ -589,7 +666,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             for (int64_t tk = 0; tk < tilesK; ++tk) {
                 int64_t rowStart = tk * 8;
 
-                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed);
+                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 Value bStride = makeI64Vec2(rewriter, loc, 1, N);
@@ -620,18 +697,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 }
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-                // Gather: each thread reads its C elements from its batch's TG region.
+                // Gather: each thread reads its C elements from TG.
                 for (size_t i = 0; i < elemsC.size(); ++i) {
+                    int64_t elemBatch = (rowDim > 0) ? elemBatchIndex(cOffsets, i) : 0;
+
                     // In sequential batch mode, skip elements not in current batch.
-                    if (batchRounds > 1 && rowDim > 0) {
-                        int64_t elemBatch = 0;
-                        int64_t stride = 1;
-                        for (int d = (int)rowDim - 1; d >= 0; --d) {
-                            elemBatch += cOffsets[i][d] * stride;
-                            stride *= cType.getShape()[d];
-                        }
+                    if (batchRounds > 1 && rowDim > 0 && !cHasBatchWarps) {
+                        // No batch warps: compile-time batch IS actual batch.
                         if (elemBatch != batchRound) continue;
                     }
+
                     int64_t rowOff = cOffsets[i][rowDim];
                     int64_t colOff = cOffsets[i][colDim];
                     Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
@@ -641,17 +716,36 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                             actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
                         arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
                             actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
+
+                    // For C with batch warps in sequential mode, add runtime batch check.
+                    if (batchRounds > 1 && rowDim > 0 && cHasBatchWarps) {
+                        Value targetBatchWarp = arith::ConstantIntOp::create(rewriter, loc,
+                            batchRound - elemBatch, 32);
+                        Value batchMatch = arith::CmpIOp::create(rewriter, loc,
+                            arith::CmpIPredicate::eq, cBatchWarpIdx, targetBatchWarp);
+                        inStrip = arith::AndIOp::create(rewriter, loc, inStrip, batchMatch);
+                    }
+
                     Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
-                    // Add batch TG offset to read from the correct batch region.
-                    // C always uses runtime warp-based batch offset (uniform offsets).
-                    Value batchOff = elemBatchTGOffset(cOffsets, i, false);
-                    Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
-                    Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
-                    Value val = gather1(ptrTG, safeIdx);
-                    if (val.getType() != outElemTy)
-                        val = fromF32(rewriter, loc, val, outElemTy);
-                    resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
-                        val, resultElems[i]);
+                    if (batchRounds > 1) {
+                        // Sequential mode: data is at TG base.
+                        Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
+                        Value val = gather1(ptrTG, safeIdx);
+                        if (val.getType() != outElemTy)
+                            val = fromF32(rewriter, loc, val, outElemTy);
+                        resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
+                            val, resultElems[i]);
+                    } else {
+                        // Warp-distributed mode: add batch TG offset.
+                        Value batchOff = elemBatchTGOffset(cOffsets, i, cMixed);
+                        Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
+                        Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
+                        Value val = gather1(ptrTG, safeIdx);
+                        if (val.getType() != outElemTy)
+                            val = fromF32(rewriter, loc, val, outElemTy);
+                        resultElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
+                            val, resultElems[i]);
+                    }
                 }
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
             }
