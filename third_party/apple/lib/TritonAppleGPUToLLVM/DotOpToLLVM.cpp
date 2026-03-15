@@ -215,11 +215,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return elems;
         };
 
+        // resolveOperand returns: (elements, offsets, encoding, dotOpIdx)
+        // dotOpIdx: -1 if not from DotOperandEncoding, 0 for A-matrix, 1 for B-matrix
         auto resolveOperand = [&](Value tritonVal, Value adaptorVal,
                                   RankedTensorType opTy)
             -> std::tuple<SmallVector<Value>,
                           SmallVector<SmallVector<unsigned>>,
-                          ttg::BlockedEncodingAttr> {
+                          ttg::BlockedEncodingAttr,
+                          int> {
             // Path 1: convert_layout -- look through to source blocked values
             if (auto cvt = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>()) {
                 Value mapped = rewriter.getRemappedValue(cvt.getSrc());
@@ -228,7 +231,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                     auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
                     if (srcEnc) {
                         auto offsets = emitOffsetForLayout(srcEnc, srcTy);
-                        return {unpack(mapped), offsets, srcEnc};
+                        return {unpack(mapped), offsets, srcEnc, -1};
                     }
                 }
             }
@@ -238,19 +241,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 auto parentEnc = dyn_cast<ttg::BlockedEncodingAttr>(dotEnc.getParent());
                 if (parentEnc) {
                     auto offsets = emitOffsetForLayout(enc, opTy);
-                    return {unpack(adaptorVal), offsets, parentEnc};
+                    return {unpack(adaptorVal), offsets, parentEnc,
+                            (int)dotEnc.getOpIdx()};
                 }
             }
             // Path 3: direct blocked encoding
             if (auto blk = dyn_cast<ttg::BlockedEncodingAttr>(enc)) {
                 auto offsets = emitOffsetForLayout(blk, opTy);
-                return {unpack(adaptorVal), offsets, blk};
+                return {unpack(adaptorVal), offsets, blk, -1};
             }
-            return {{}, {}, nullptr};
+            return {{}, {}, nullptr, -1};
         };
 
-        auto [elemsA, aOffsets, aSrcEnc] = resolveOperand(op.getA(), adaptor.getA(), aType);
-        auto [elemsB, bOffsets, bSrcEnc] = resolveOperand(op.getB(), adaptor.getB(), bType);
+        auto [elemsA, aOffsets, aSrcEnc, aDotOpIdx] = resolveOperand(op.getA(), adaptor.getA(), aType);
+        auto [elemsB, bOffsets, bSrcEnc, bDotOpIdx] = resolveOperand(op.getB(), adaptor.getB(), bType);
         auto elemsC = unpack(adaptor.getC());
         auto cOffsets = emitOffsetForLayout(cEnc, cType);
 
@@ -369,6 +373,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto [aBaseRow, aBaseCol] = makeBase(aSrcEnc, M, K);
         auto [bBaseRow, bBaseCol] = makeBase(bSrcEnc, K, N);
         auto [cBaseRow, cBaseCol] = makeBase(cEnc, M, N);
+
+        // For DotOperandEncoding (Path 2), the contracting dimension (K)
+        // is fully replicated per thread. The offsets from emitOffsetForLayout
+        // already span the full K range, so the base for the K dim must be 0.
+        // Otherwise base + offset overshoots the K dimension.
+        Value zero32 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+        if (aDotOpIdx == 0) {
+            // A is [M, K]: col dim is K (contracting) → zero base
+            aBaseCol = zero32;
+        }
+        if (bDotOpIdx == 1) {
+            // B is [K, N]: row dim is K (contracting) → zero base
+            bBaseRow = zero32;
+        }
 
         // ── Create threadgroup global ─────────────────────────────────────
         unsigned id = getCounter(ctx)++;
@@ -612,8 +630,21 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // All data goes to TG base (single region). Runtime batch filtering
         // ensures only the correct batch's data is scattered.
 
+        // TODO: Reconsider — sequential fallback wastes warp parallelism when
+        // layouts are inconsistent. Ideally remap A/B scatter offsets to match
+        // C's batch-to-warp mapping in the warp-distributed path instead.
+        bool batchConsistent = true;
+        if (batchSize > 1) {
+            auto aWpc = aSrcEnc.getWarpsPerCTA();
+            auto bWpc = bSrcEnc.getWarpsPerCTA();
+            int64_t matWarpsA = aWpc[rowDim] * aWpc[colDim];
+            int64_t matWarpsB = bWpc[rowDim] * bWpc[colDim];
+            if (matWarpsA != matWarpsC || matWarpsB != matWarpsC)
+                batchConsistent = false;
+        }
+
         int64_t batchRounds = 1;
-        if (batchSize > 1 && numBatchWarps < batchSize)
+        if (batchSize > 1 && (numBatchWarps < batchSize || !batchConsistent))
             batchRounds = batchSize;
 
         for (int64_t batchRound = 0; batchRound < batchRounds; ++batchRound) {

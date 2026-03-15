@@ -3324,8 +3324,6 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
                 pytest.skip(f"MPS does not support {input_precision} input precision")
             if in_dtype in ("float8e5", "float8e4nv"):
                 pytest.skip(f"MPS does not support {in_dtype}")
-            if num_warps >= 16:
-                pytest.skip("MPS exceeds max threads per threadgroup with num_warps>=16")
 
         if is_hip():
             if in_dtype in ("float8e5", "float8e4nv") and not (is_hip_gfx1250() or is_hip_cdna4() or is_hip_rdna4()):
