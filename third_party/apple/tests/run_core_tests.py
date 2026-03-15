@@ -8,6 +8,7 @@ Usage:
   python third_party/apple/tests/run_core_tests.py arith memory  # run multiple
   python third_party/apple/tests/run_core_tests.py --list        # list categories
   python third_party/apple/tests/run_core_tests.py --validated   # run only validated categories
+  python third_party/apple/tests/run_core_tests.py --rerun       # rerun validated categories (verify still pass)
 """
 import subprocess, sys, os, shutil, re
 
@@ -182,23 +183,40 @@ def run_category(name, tests, verbose=False):
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
 
-    k_expr = " or ".join(tests)
-    cmd = [
-        sys.executable, "-m", "pytest", TEST_FILE,
-        "--device", "mps",
-        "-k", k_expr,
-        "--no-header", "-q", "--tb=line",
-    ]
+    # If any test has brackets (parametrized), pass as node IDs; otherwise use -k
+    has_params = any("[" in t for t in tests)
+    if has_params:
+        test_ids = [f"{TEST_FILE}::{t}" for t in tests]
+        cmd = [
+            sys.executable, "-u", "-m", "pytest", *test_ids,
+            "--device", "mps",
+            "-v", "--tb=line",
+        ]
+    else:
+        k_expr = " or ".join(tests)
+        cmd = [
+            sys.executable, "-u", "-m", "pytest", TEST_FILE,
+            "--device", "mps",
+            "-k", k_expr,
+            "-v", "--tb=line",
+        ]
 
     print(f"\n── {name}: {', '.join(tests)}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=TRITON_ROOT)
-    except subprocess.TimeoutExpired as e:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, cwd=TRITON_ROOT)
+        all_output = ""
+        for line in proc.stdout:
+            all_output += line
+            line = line.rstrip()
+            if line and ("FAILED" in line or "ERROR" in line):
+                print(f"   {line}")
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
         print(f"   TIMEOUT: hung after 300s (GPU likely stuck)")
         return 0, len(tests), 0
-
-    all_output = result.stdout + "\n" + result.stderr
 
     # Find FAILED lines
     failures = []
@@ -262,10 +280,28 @@ def main():
 
     verbose = "--verbose" in args or "-v" in args
     validated_only = "--validated" in args
-    args = [a for a in args if a not in ("--verbose", "-v", "--list", "--validated")]
+    rerun = "--rerun" in args
+    args = [a for a in args if a not in ("--verbose", "-v", "--list", "--validated", "--rerun")]
+
+    # Specific tests to rerun for quick regression check
+    RERUN_TESTS = [
+        "test_cat_nd", "test_scan2d", "test_scan_1d",
+        "test_strided_load[float64]", "test_strided_store[float64]",
+        "test_indirect_load[float64]", "test_indirect_store[float64]",
+        "test_generic_reduction",
+        "test_precise_math[1-tl.math.sqrt_rn(x)-tl.math.sqrt(x.to(tl.float64)).to(tl.float32)]",
+        "test_umulhi[int32]",
+        "test_libdevice_rint[float32]", "test_libdevice_rint[float64]",
+    ]
 
     if args:
         names = args
+    elif rerun:
+        p, f, e = run_category("rerun", RERUN_TESTS, verbose=verbose)
+        print(f"\n{'='*60}")
+        print(f"  RERUN: {p} passed, {f} failed, {e} errors")
+        print(f"{'='*60}")
+        return
     elif validated_only:
         names = [n for n in CATEGORIES if n in SKIP_CATEGORIES]
     else:
@@ -277,7 +313,7 @@ def main():
         if name not in CATEGORIES:
             print(f"Unknown category '{name}', valid: {', '.join(CATEGORIES.keys())}")
             continue
-        if not args and not validated_only and name in SKIP_CATEGORIES:
+        if not args and not validated_only and not rerun and name in SKIP_CATEGORIES:
             print(f"\n── {name}: SKIP (validated)")
             continue
         tests = CATEGORIES[name]

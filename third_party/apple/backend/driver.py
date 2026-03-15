@@ -3,9 +3,9 @@ Apple MPS Triton backend driver.
 
 Dispatch pipeline:
   metallib bytes (from compiler.py make_metallib stage)
-    → torch._C._mps_loadMetalllib(bytes)   [patched PyTorch]
-    → _mps_PrecompiledShaderLibrary
-    → lib.kernel_name(*args, threads=grid, group_size=block, arg_casts=...)
+    → metal_utils.load_metallib(bytes)   [JIT-compiled, links against libtorch]
+    → MetalLibrary.get_function(name)    → MetalKernel (PSO)
+    → kernel(*tensors, threads=, group_size=)  [zero-copy via getMTLBufferStorage]
 """
 
 import re as _re
@@ -13,6 +13,60 @@ import struct as _struct
 import torch
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
+
+
+def _load_metal_utils():
+    """JIT-compile metal_utils.m → .so, linked against user's libtorch."""
+    import os, hashlib, tempfile, subprocess, importlib.util, sysconfig
+    from pathlib import Path
+
+    dirname = os.path.dirname(os.path.abspath(__file__))
+    src = Path(os.path.join(dirname, "metal_utils.m")).read_text()
+
+    # Cache
+    key = hashlib.sha256(src.encode()).hexdigest()
+    from triton.runtime.cache import get_cache_manager
+    cache = get_cache_manager(key)
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    cache_path = cache.get_file(f"metal_utils{suffix}")
+
+    if cache_path:
+        spec = importlib.util.spec_from_file_location("metal_utils", cache_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    # Find libtorch paths
+    torch_dir = os.path.dirname(torch.__file__)
+    torch_lib = os.path.join(torch_dir, "lib")
+    torch_inc = os.path.join(torch_dir, "include")
+    py_inc = sysconfig.get_path("include")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_path = os.path.join(tmpdir, "metal_utils.m")
+        so_path = os.path.join(tmpdir, f"metal_utils{suffix}")
+        Path(src_path).write_text(src)
+        subprocess.check_call([
+            "clang", src_path, "-O3", "-shared", "-fPIC", "-o", so_path,
+            "-ObjC++", "-std=c++17",
+            f"-I{py_inc}",
+            f"-I{torch_inc}",
+            f"-I{torch_inc}/torch/csrc/api/include",
+            f"-L{torch_lib}", "-ltorch", "-lc10", "-ltorch_python",
+            "-framework", "Metal", "-framework", "Foundation",
+            "-undefined", "dynamic_lookup",
+            "-Wno-deprecated-declarations",
+            f"-Wl,-rpath,{torch_lib}",
+        ])
+        with open(so_path, "rb") as f:
+            cache_path = cache.put(f.read(), f"metal_utils{suffix}", binary=True)
+
+    spec = importlib.util.spec_from_file_location("metal_utils", cache_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -91,36 +145,28 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
 
 class MPSUtils:
     """
-    Drop-in for CudaUtils — pure Python, no C extension needed.
-    Triton calls driver.active.utils.load_binary(...).
+    Metal GPU utils — JIT-compiles metal_utils.m (links against libtorch)
+    for zero-copy MPS tensor dispatch. Works with any PyTorch 2.0+.
     """
+
+    def __init__(self):
+        self._metal = _load_metal_utils()
 
     def load_binary(self, name, metallib_bytes, shared_mem, device):
         """
         Returns (module, function, n_regs, n_spills, n_max_threads).
-        - module   = the _mps_PrecompiledShaderLibrary (held alive to prevent GC)
-        - function = the _mps_MetalKernel for `name`
-        - n_regs, n_spills = 0 (not tracked on Metal)
-        - n_max_threads    = 1024 (hardware max threadgroup size on Apple Silicon)
         """
-        if not hasattr(torch._C, '_mps_loadMetalllib'):
-            raise RuntimeError(
-                "torch._C._mps_loadMetalllib not found — "
-                "rebuild PyTorch with the MPS patch (see mps-flash-attention repo)"
-            )
         try:
-            module = torch._C._mps_loadMetalllib(bytes(metallib_bytes))
-            function = getattr(module, name)
+            module = self._metal.load_metallib(bytes(metallib_bytes))
+            function = module.get_function(name)
+            max_threads = function.max_total_threads_per_threadgroup
+            return module, function, 0, 0, max_threads
         except RuntimeError as e:
             msg = str(e)
-            # Metal PSO creation fails when threadgroup memory or thread count
-            # exceeds hardware limits. Raise OutOfResources so the autotuner
-            # skips this config instead of hard-erroring.
             m = _re.search(r'Threadgroup (?:memory )?size \((\d+)\) exceeds the maximum .+ \((\d+)\)', msg)
             if m:
                 raise OutOfResources(int(m.group(1)), int(m.group(2)), "Metal PSO") from e
             raise
-        return module, function, 0, 0, 1024
 
     def unload_module(self, module):
         del module

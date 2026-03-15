@@ -35,64 +35,57 @@ from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
 
-def _find_metalasm_dylib():
-    """Find libMetalASMBridge.dylib, building from submodule if needed."""
+def _find_metalir_dylib():
+    """Find libMetalIRBridge.dylib (C++ metal-ir-pipeline)."""
     # 1. Environment variable override
-    if os.environ.get('METALASM_DYLIB_PATH'):
-        return os.environ['METALASM_DYLIB_PATH']
+    if os.environ.get('METALIR_DYLIB_PATH'):
+        return os.environ['METALIR_DYLIB_PATH']
 
-    # 2. Submodule build (third_party/apple/MetalASM/)
-    submodule_dir = os.path.join(os.path.dirname(__file__), '..', 'MetalASM')
-    submodule_dylib = os.path.join(submodule_dir, '.build', 'release', 'libMetalASMBridge.dylib')
-    if os.path.isdir(submodule_dir) and not os.path.exists(submodule_dylib):
-        # Auto-build on first use
-        import subprocess
-        try:
-            subprocess.check_call(
-                ['swift', 'build', '-c', 'release', '--product', 'MetalASMBridge'],
-                cwd=os.path.abspath(submodule_dir),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-    if os.path.exists(submodule_dylib):
-        return submodule_dylib
+    # 2. Sibling directory (../../metal-ir-pipeline/build/)
+    for rel in [
+        os.path.join('..', 'metal-ir-pipeline'),
+        os.path.join('..', '..', '..', '..', 'metal-ir-pipeline'),
+    ]:
+        d = os.path.join(os.path.dirname(__file__), rel, 'build', 'lib', 'Bridge', 'libMetalIRBridge.dylib')
+        if os.path.exists(os.path.abspath(d)):
+            return os.path.abspath(d)
 
     return None
 
 
-def _load_metalasm():
-    """Load MetalASMBridge dylib and return a compile function, or None."""
-    dylib = _find_metalasm_dylib()
+def _load_metalir():
+    """Load MetalIRBridge dylib and return a compile function."""
+    dylib = _find_metalir_dylib()
     if not dylib:
-        return None
-    try:
-        lib = ctypes.CDLL(dylib)
-        lib.metalasm_compile.restype  = ctypes.c_void_p
-        lib.metalasm_compile.argtypes = [
-            ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.c_char_p,
-            ctypes.c_size_t,
-        ]
-        lib.metalasm_free.argtypes = [ctypes.c_void_p]
+        raise RuntimeError(
+            "libMetalIRBridge.dylib not found. Build metal-ir-pipeline first:\n"
+            "  cd metal-ir-pipeline && cmake -B build -DLLVM_DIR=... && cmake --build build\n"
+            "Or set METALIR_DYLIB_PATH=/path/to/libMetalIRBridge.dylib")
+    lib = ctypes.CDLL(dylib)
+    lib.metalir_compile.restype  = ctypes.c_void_p
+    lib.metalir_compile.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    lib.metalir_free.argtypes = [ctypes.c_void_p]
 
-        def compile_ir(llvm_ir: str) -> bytes:
-            out_len = ctypes.c_uint64(0)
-            errbuf  = ctypes.create_string_buffer(512)
-            ptr = lib.metalasm_compile(
-                llvm_ir.encode(), ctypes.byref(out_len), errbuf, 512)
-            if ptr:
-                data = bytes((ctypes.c_ubyte * out_len.value).from_address(ptr))
-                lib.metalasm_free(ptr)
-                return data
-            raise RuntimeError(f"MetalASM: {errbuf.value.decode()}")
+    def compile_ir(llvm_ir: str) -> bytes:
+        out_len = ctypes.c_uint64(0)
+        errbuf  = ctypes.create_string_buffer(512)
+        ptr = lib.metalir_compile(
+            llvm_ir.encode(), ctypes.byref(out_len), errbuf, 512)
+        if ptr:
+            data = bytes((ctypes.c_ubyte * out_len.value).from_address(ptr))
+            lib.metalir_free(ptr)
+            return data
+        raise RuntimeError(f"MetalIR compile failed: {errbuf.value.decode()}")
 
-        return compile_ir
-    except Exception:
-        return None
+    return compile_ir
 
 
-_metalasm_compile = _load_metalasm()
+_metalir_compile = _load_metalir()
 
 
 @dataclass(frozen=True)
@@ -265,28 +258,27 @@ class MPSBackend(BaseBackend):
             kname = metadata["name"]
             open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
 
-        # MetalASM: handles all AIR transforms (MMA ptrs, TG GEPs, barrier rename,
-        # system-value lowering, !air.kernel metadata) in-process.
-        if _metalasm_compile:
-            result = _metalasm_compile(llvm_ir)
-            if debug:
-                open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
-            return result
+        # MetalIR C++ pipeline: LLVM IR → AIR transforms → v1 bitcode → metallib
+        result = _metalir_compile(llvm_ir)
+        if debug:
+            open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
+        return result
 
-        # Fallback: xcrun metal-as + metallib (requires sequential SSA numbering)
-        with tempfile.TemporaryDirectory() as tmp:
-            ll_path  = os.path.join(tmp, "kernel.ll")
-            air_path = os.path.join(tmp, "kernel.air")
-            lib_path = os.path.join(tmp, "kernel.metallib")
+        # Dead code — xcrun fallback removed, MetalIR is the only path.
+        if False:  # noqa
+            with tempfile.TemporaryDirectory() as tmp:
+                ll_path  = os.path.join(tmp, "kernel.ll")
+                air_path = os.path.join(tmp, "kernel.air")
+                lib_path = os.path.join(tmp, "kernel.metallib")
 
-            with open(ll_path, "w") as f:
-                f.write(llvm_ir)
+                with open(ll_path, "w") as f:
+                    f.write(llvm_ir)
 
-            subprocess.run(
-                ["xcrun", "-sdk", "macosx", "metal-as", ll_path, "-o", air_path],
-                check=True)
-            subprocess.run(
-                ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path],
+                subprocess.run(
+                    ["xcrun", "-sdk", "macosx", "metal-as", ll_path, "-o", air_path],
+                    check=True)
+                subprocess.run(
+                    ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path],
                 check=True)
 
             with open(lib_path, "rb") as f:
