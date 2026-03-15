@@ -217,15 +217,50 @@ class MPSLauncher:
         # MetalASM Pass 5b packs all scalars into ONE device buffer,
         # so the IR param order is: [pointers..., packed_scalar_buf, system_values].
         # We need to separate pointers from scalars at launch time.
-        self.ptr_indices = []    # indices into expanded that are pointers
-        self.scalar_indices = [] # indices into expanded that are scalars
+        #
+        # Python tuple kernel args are flattened recursively: an empty tuple
+        # contributes nothing; nested tuples expand to their leaf elements.
+        # Leaf entries with type 'constexpr' (inlined constants inside tuples)
+        # are skipped — they have no GPU arg slot.
+        #
+        # self._flat_arg_keep[i] says whether flat_arg[i] (after full tuple
+        # flattening in __call__) should be forwarded to the GPU.  We need this
+        # because constexpr values inside tuples ARE present in flat_args but
+        # must NOT be passed to the kernel.
+        self.ptr_indices = []    # indices into the KEPT slice of flat_args
+        self.scalar_indices = [] # indices into the KEPT slice of flat_args
         self.scalar_types = []   # type strings for scalars (for packing)
-        for slot, ty in enumerate(expanded):
+
+        def _flatten_types_with_mask(types):
+            """Recursively flatten tuple types; return (all_types, keep_mask).
+
+            all_types: leaf type for every position (including constexpr)
+            keep_mask: True where the leaf is a real GPU arg (not constexpr)
+            """
+            all_tys, keep = [], []
+            for ty in types:
+                if isinstance(ty, tuple):
+                    sub_tys, sub_keep = _flatten_types_with_mask(ty)
+                    all_tys.extend(sub_tys)
+                    keep.extend(sub_keep)
+                else:
+                    all_tys.append(ty)
+                    keep.append(ty != 'constexpr')
+            return all_tys, keep
+
+        all_types, keep_mask = _flatten_types_with_mask(expanded)
+        self._flat_arg_keep = keep_mask  # used in __call__ to filter flat_args
+
+        kept_slot = 0
+        for ty, keep in zip(all_types, keep_mask):
+            if not keep:
+                continue
             if _is_pointer_type(ty):
-                self.ptr_indices.append(slot)
+                self.ptr_indices.append(kept_slot)
             else:
-                self.scalar_indices.append(slot)
+                self.scalar_indices.append(kept_slot)
                 self.scalar_types.append(ty)
+            kept_slot += 1
 
         # Pre-compute packed buffer layout
         if self.scalar_types:
@@ -248,17 +283,33 @@ class MPSLauncher:
             launch_enter_hook(launch_metadata)
 
         # Strip constexpr args and decompose TensorDescriptors.
+        # Python tuple args are flattened recursively so that the positional
+        # index structure matches _flat_arg_keep built in __init__.
+        # After full flattening, positions with keep=False (constexpr values
+        # inside tuples) are dropped before indexing with ptr_indices /
+        # scalar_indices.
         from triton.runtime.jit import TensorWrapper
-        flat_args = []
+
+        def _flatten_arg(a, out):
+            """Recursively flatten an arg value, expanding tuples to leaves."""
+            if isinstance(a, TensorWrapper):
+                out.append(a.base)
+            elif isinstance(a, TensorDescriptor):
+                out.extend(decompose_descriptor(a))
+            elif isinstance(a, tuple):
+                for elem in a:
+                    _flatten_arg(elem, out)
+            else:
+                out.append(a)
+
+        all_flat_args = []
         for i, a in enumerate(args):
             if i in self.constexpr_py_slots:
                 continue
-            if isinstance(a, TensorWrapper):
-                flat_args.append(a.base)
-            elif isinstance(a, TensorDescriptor):
-                flat_args.extend(decompose_descriptor(a))
-            else:
-                flat_args.append(a)
+            _flatten_arg(a, all_flat_args)
+
+        # Apply keep mask: drop constexpr-inside-tuple positions.
+        flat_args = [v for v, keep in zip(all_flat_args, self._flat_arg_keep) if keep]
 
         # Separate pointer args from scalar args.
         # IR param order after Pass 5b: [ptr0, ptr1, ..., packed_scalar_buf]
